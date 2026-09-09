@@ -1,0 +1,14 @@
+.venv/
+.cache/
+.worktrees/
+.photos-shrink/
+cookies*.txt
+*storage-state*.json
+__pycache__/
+.pytest_cache/
+.ruff_cache/
+*.egg-info/
+dist/
+build/
+plan.csv
+report.csv
