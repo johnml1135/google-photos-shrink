@@ -1,0 +1,38 @@
+[photos]
+short_edge = 1500
+format = "avif"
+quality = 60
+
+[videos]
+long_edge = 1920
+short_edge = 1080
+codec = "hevc"
+crf = 28
+preset = "slow"
+max_fps = 0
+audio_bitrate_kbps = 96
+
+[tools]
+ffmpeg = ".cache/tools/ffmpeg/ffmpeg-9.0.1-essentials_build/bin/ffmpeg.exe"
+ffprobe = ".cache/tools/ffmpeg/ffmpeg-9.0.1-essentials_build/bin/ffprobe.exe"
+
+[google]
+cookies_file = ".photos-shrink/cookies.txt"
+browser_profile = ".photos-shrink/browser"
+browser_channel = "chrome"
+browser_headless = true
+account_index = 1
+
+[run]
+work_dir = ".photos-shrink"
+pause_seconds = 10
+minimum_savings_percent = 20
+threads = 2
+skip_shared = false
+limit = 0
+skip_non_space_consuming = true
+
+[exclude]
+timezone = "America/New_York"
+date_ranges = []
+name_globs = []

@@ -6,6 +6,7 @@ cookies*.txt
 *storage-state*.json
 __pycache__/
 .pytest_cache/
+.pytest-*/
 .ruff_cache/
 *.egg-info/
 dist/
