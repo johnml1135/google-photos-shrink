@@ -25,9 +25,12 @@ DEFAULTS: dict[str, dict[str, Any]] = {
                "preset": "slow", "max_fps": 0, "audio_bitrate_kbps": 96},
     "tools": {"ffmpeg": "ffmpeg", "ffprobe": "ffprobe"},
     "google": {"cookies_file": ".photos-shrink/cookies.txt", "browser_profile": ".photos-shrink/browser",
-               "browser_channel": "chrome", "browser_headless": True, "account_index": 0},
+               "browser_channel": "chrome", "browser_headless": True, "account_index": 0,
+               "session_refresh_seconds": 300, "upload_timeout_seconds": 300,
+               "upload_poll_seconds": 5, "auto_original_quality": True},
     "run": {"work_dir": ".photos-shrink", "pause_seconds": 10, "minimum_savings_percent": 20,
-            "threads": 2, "skip_shared": True, "limit": 0, "skip_non_space_consuming": True},
+            "threads": 2, "skip_shared": True, "limit": 0, "skip_non_space_consuming": True,
+            "photos_only": False, "selection_order": "largest"},
     "exclude": {"timezone": "America/New_York", "date_ranges": [], "name_globs": []},
 }
 ALLOWED = {name: set(values) for name, values in DEFAULTS.items()}
@@ -112,10 +115,19 @@ def load_config(path: str | os.PathLike[str] = "shrink.toml") -> Settings:
         raise ConfigError("exclude.date_ranges must be a list")
     if not isinstance(values["run"]["skip_shared"], bool) or not isinstance(values["run"]["skip_non_space_consuming"], bool):
         raise ConfigError("run.skip_shared and run.skip_non_space_consuming must be booleans")
+    if not isinstance(values["run"]["photos_only"], bool):
+        raise ConfigError("run.photos_only must be a boolean")
+    if not isinstance(values["run"]["selection_order"], str) or values["run"]["selection_order"] not in {"largest", "newest"}:
+        raise ConfigError("run.selection_order must be largest or newest")
     if isinstance(values["google"]["account_index"], bool) or not isinstance(values["google"]["account_index"], int) or values["google"]["account_index"] < 0:
         raise ConfigError("google.account_index must be an integer >= 0")
     if not isinstance(values["google"]["browser_headless"], bool):
         raise ConfigError("google.browser_headless must be a boolean")
+    if not isinstance(values["google"]["auto_original_quality"], bool):
+        raise ConfigError("google.auto_original_quality must be a boolean")
+    _positive_int(values["google"]["session_refresh_seconds"], "google.session_refresh_seconds")
+    _positive_int(values["google"]["upload_timeout_seconds"], "google.upload_timeout_seconds", 1)
+    _positive_int(values["google"]["upload_poll_seconds"], "google.upload_poll_seconds", 1)
     _positive_int(values["photos"]["short_edge"], "photos.short_edge", 1)
     _positive_int(values["photos"]["quality"], "photos.quality", 1)
     if values["photos"]["quality"] > 100:
@@ -216,6 +228,10 @@ browser_profile = ".photos-shrink/browser"
 browser_channel = "chrome"
 browser_headless = true
 account_index = 0
+session_refresh_seconds = 300
+upload_timeout_seconds = 300
+upload_poll_seconds = 5
+auto_original_quality = true
 
 [run]
 work_dir = ".photos-shrink"
@@ -225,6 +241,8 @@ threads = 2
 skip_shared = true
 limit = 0
 skip_non_space_consuming = true
+photos_only = false
+selection_order = "largest"
 
 [exclude]
 timezone = "America/New_York"

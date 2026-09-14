@@ -59,3 +59,58 @@ def test_browser_headless_defaults_true_and_must_be_boolean(tmp_path: Path):
     path.write_text("[google]\nbrowser_headless = 'yes'\n", encoding="utf-8")
     with pytest.raises(ConfigError, match="browser_headless"):
         load_config(path)
+
+
+def test_auto_original_quality_defaults_true_and_must_be_boolean(tmp_path: Path):
+    path = tmp_path / "shrink.toml"
+    path.write_text("", encoding="utf-8")
+    assert load_config(path).google["auto_original_quality"] is True
+
+    path.write_text("[google]\nauto_original_quality = false\n", encoding="utf-8")
+    assert load_config(path).google["auto_original_quality"] is False
+    path.write_text("[google]\nauto_original_quality = 'yes'\n", encoding="utf-8")
+    with pytest.raises(ConfigError, match="auto_original_quality"):
+        load_config(path)
+
+
+def test_pilot_selection_defaults_and_validation(tmp_path: Path):
+    path = tmp_path / "shrink.toml"
+    path.write_text("", encoding="utf-8")
+    cfg = load_config(path)
+    assert cfg.google["session_refresh_seconds"] == 300
+    assert cfg.google["upload_timeout_seconds"] == 300
+    assert cfg.google["upload_poll_seconds"] == 5
+    assert cfg.run["photos_only"] is False
+    assert cfg.run["selection_order"] == "largest"
+
+    path.write_text("[google]\nsession_refresh_seconds = -1\n", encoding="utf-8")
+    with pytest.raises(ConfigError, match="session_refresh_seconds"):
+        load_config(path)
+    path.write_text("[run]\nphotos_only = 'yes'\n", encoding="utf-8")
+    with pytest.raises(ConfigError, match="photos_only"):
+        load_config(path)
+    path.write_text("[run]\nselection_order = 'oldest'\n", encoding="utf-8")
+    with pytest.raises(ConfigError, match="selection_order"):
+        load_config(path)
+    path.write_text("[run]\nselection_order = ['newest']\n", encoding="utf-8")
+    with pytest.raises(ConfigError, match="selection_order"):
+        load_config(path)
+    path.write_text("[google]\nupload_timeout_seconds = 0\n", encoding="utf-8")
+    with pytest.raises(ConfigError, match="upload_timeout_seconds"):
+        load_config(path)
+    path.write_text("[google]\nupload_poll_seconds = 0\n", encoding="utf-8")
+    with pytest.raises(ConfigError, match="upload_poll_seconds"):
+        load_config(path)
+
+
+def test_control_settings_do_not_change_encoding_fingerprint(tmp_path: Path):
+    path = tmp_path / "shrink.toml"
+    path.write_text("", encoding="utf-8")
+    original = load_config(path).fingerprint
+    path.write_text(
+        "[google]\nsession_refresh_seconds = 0\nupload_timeout_seconds = 600\nupload_poll_seconds = 9\n"
+        "auto_original_quality = false\n"
+        "[run]\nphotos_only = true\nselection_order = 'newest'\nlimit = 1\n",
+        encoding="utf-8",
+    )
+    assert load_config(path).fingerprint == original

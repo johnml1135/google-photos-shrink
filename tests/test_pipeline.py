@@ -264,6 +264,82 @@ def _resume_state(tmp_path: Path, cfg, remote: FakeRemote, *, output_bytes: byte
     return state, backup, output, output_hash
 
 
+class RecoveryRemote(FakeRemote):
+    def __init__(self, root):
+        super().__init__(root)
+        self.registered: list[set[str]] = []
+
+    def register_replacements(self, ids):
+        self.registered.append(set(ids))
+
+
+def test_upload_intent_recovery_registers_exact_hash_match_before_verification(tmp_path: Path):
+    config = tmp_path / "shrink.toml"
+    config.write_text(
+        "[run]\nwork_dir = 'work'\npause_seconds = 0\n",
+        encoding="utf-8",
+    )
+    cfg = load_config(config)
+    remote = RecoveryRemote(tmp_path)
+    remote.found_upload = {"id": "replacement", "dedup_key": "new-dedup", "size_bytes": 10}
+    state = StateStore(tmp_path / "state.sqlite", "account", cfg.fingerprint)
+    item = remote.items[0]
+    backup = tmp_path / "original.jpg"
+    backup.write_bytes(b"original" * 12 + b"1234")
+    output = tmp_path / "output.avif"
+    output.write_bytes(b"compressed")
+    import hashlib
+
+    original_hash = hashlib.sha256(backup.read_bytes()).hexdigest()
+    output_hash = hashlib.sha256(output.read_bytes()).hexdigest()
+    state.capture_snapshot("orig", item, original_hash, backup)
+    state.set_plan("orig", 10, 90, output)
+    state.record_upload_intent("orig", output_hash, output)
+    report = tmp_path / "report.csv"
+    result = Pipeline(cfg, remote, state, media=FakeMedia()).run(
+        yes=True, keep_originals=True, report_path=report
+    )
+    assert result["verified"] == 1
+    assert remote.registered == [set(), {"replacement"}]
+    assert state.get_item("orig")["replacement_id"] == "replacement"
+    with report.open(newline="", encoding="utf-8-sig") as stream:
+        row = next(csv.DictReader(stream))
+    assert row["actual_size_bytes"] == "10"
+    state.close()
+
+
+def test_pending_upload_match_protects_recovered_replacement_from_inventory(tmp_path: Path):
+    config = tmp_path / "shrink.toml"
+    config.write_text(
+        "[run]\nwork_dir = 'work'\npause_seconds = 0\n",
+        encoding="utf-8",
+    )
+    cfg = load_config(config)
+    remote = RecoveryRemote(tmp_path)
+    remote.found_upload = {"id": "replacement", "dedup_key": "new-dedup", "size_bytes": 10}
+    remote.items.append(_selection_item("replacement", size=100, timestamp=1704067200000))
+    state = StateStore(tmp_path / "state.sqlite", "account", cfg.fingerprint)
+    item = remote.items[0]
+    backup = tmp_path / "original.jpg"
+    backup.write_bytes(b"original" * 12 + b"1234")
+    output = tmp_path / "output.avif"
+    output.write_bytes(b"compressed")
+    import hashlib
+
+    original_hash = hashlib.sha256(backup.read_bytes()).hexdigest()
+    output_hash = hashlib.sha256(output.read_bytes()).hexdigest()
+    state.capture_snapshot("orig", item, original_hash, backup)
+    state.set_plan("orig", 10, 90, output)
+    state.record_upload_intent("orig", output_hash, output)
+    result = Pipeline(cfg, remote, state, media=FakeMedia()).run(
+        yes=True, keep_originals=True, report_path=tmp_path / "report.csv"
+    )
+    assert result["planned"] == 1
+    assert result["verified"] == 1
+    assert remote.uploads == 0
+    state.close()
+
+
 @pytest.mark.parametrize("skip_setup", [
     lambda item: item.update(space_taken_bytes=0),
     lambda item: item.update(metadata={"albums": [{"shared": True}]}),
@@ -364,6 +440,121 @@ def test_limit_counts_only_savings_qualified_plans(tmp_path: Path):
         )
     assert result["planned"] == 1
     assert "qualified.jpg" in (tmp_path / "plan.csv").read_text(encoding="utf-8-sig")
+
+
+def _selection_item(item_id: str, *, size: int = 100, kind: str = "photo", timestamp: int = 0) -> dict:
+    return {
+        "id": item_id,
+        "dedup_key": f"dedup-{item_id}",
+        "filename": f"{item_id}.jpg",
+        "size_bytes": size,
+        "width": 100,
+        "height": 100,
+        "kind": kind,
+        "timestamp_ms": timestamp,
+        "timezone_offset": 0,
+        "duration_seconds": None,
+        "mime_type": "image/jpeg" if kind == "photo" else "video/mp4",
+        "metadata": {"albums": []},
+        "skip_reason": None,
+    }
+
+
+class StreamingRemote(FakeRemote):
+    def __init__(self, root, items):
+        super().__init__(root)
+        self.items = items
+        self.yielded = []
+        self.closed = False
+
+    def list_items(self):
+        try:
+            for item in self.items:
+                self.yielded.append(item["id"])
+                yield item
+        finally:
+            self.closed = True
+
+
+def test_newest_first_stops_after_eligible_plan_and_closes_listing(tmp_path: Path):
+    config = tmp_path / "shrink.toml"
+    config.write_text("[run]\nwork_dir = 'work'\nlimit = 1\nselection_order = 'newest'\n", encoding="utf-8")
+    cfg = load_config(config)
+    remote = StreamingRemote(tmp_path, [
+        _selection_item("skipped", timestamp=3),
+        _selection_item("too-small", size=10, timestamp=2),
+        _selection_item("qualified", timestamp=1),
+        _selection_item("overread", timestamp=0),
+    ])
+    remote.items[0]["skip_reason"] = "fixture_skip"
+    class SelectionMedia(FakeMedia):
+        def estimate(self, source, settings, work_dir):
+            return {"estimated_bytes": 10 if source.name.endswith("qualified.jpg") else 10, "method": "selection"}
+    with StateStore(tmp_path / "state.sqlite", "account", cfg.fingerprint) as state:
+        result = Pipeline(cfg, remote, state, media=SelectionMedia()).run(plan_only=True)
+    assert result["planned"] == 1
+    assert remote.yielded == ["skipped", "too-small", "qualified"]
+    assert remote.closed is True
+
+
+def test_default_largest_first_scans_all_and_plans_largest(tmp_path: Path):
+    config = tmp_path / "shrink.toml"
+    config.write_text("[run]\nwork_dir = 'work'\nlimit = 1\n", encoding="utf-8")
+    cfg = load_config(config)
+    remote = StreamingRemote(tmp_path, [
+        _selection_item("small", size=100),
+        _selection_item("large", size=200),
+    ])
+    remote.download = lambda item, destination: destination.write_bytes(b"x" * item["size_bytes"])
+    with StateStore(tmp_path / "state.sqlite", "account", cfg.fingerprint) as state:
+        result = Pipeline(cfg, remote, state, media=FakeMedia()).run(plan_only=True)
+    assert result["planned"] == 1
+    assert remote.yielded == ["small", "large"]
+    report = (tmp_path / "work" / "photos-shrink.csv").read_text(encoding="utf-8-sig")
+    assert "large.jpg" in report
+    assert "small.jpg" not in report
+
+
+def test_pending_plan_fills_limit_without_inventory_or_new_download(tmp_path: Path):
+    config = tmp_path / "shrink.toml"
+    config.write_text("[run]\nwork_dir = 'work'\nlimit = 1\nselection_order = 'newest'\n", encoding="utf-8")
+    cfg = load_config(config)
+    remote = StreamingRemote(tmp_path, [_selection_item("new")])
+    item = _selection_item("pending")
+    backup = tmp_path / "pending.jpg"
+    backup.write_bytes(b"original" * 12 + b"1234")
+    import hashlib
+    with StateStore(tmp_path / "state.sqlite", "account", cfg.fingerprint) as state:
+        state.capture_snapshot("pending", item, hashlib.sha256(backup.read_bytes()).hexdigest(), backup)
+        pending_output = tmp_path / "pending.avif"
+        pending_output.write_bytes(b"output")
+        state.set_plan("pending", 10, 90, pending_output)
+        state.record_upload_intent("pending", hashlib.sha256(b"output").hexdigest(), pending_output)
+        result = Pipeline(cfg, remote, state, media=FakeMedia()).run(plan_only=True)
+    assert result["planned"] == 1
+    assert remote.yielded == []
+
+
+def test_photos_only_excludes_pending_video_and_allows_photo(tmp_path: Path):
+    config = tmp_path / "shrink.toml"
+    config.write_text("[run]\nwork_dir = 'work'\nphotos_only = true\nlimit = 1\nselection_order = 'newest'\n", encoding="utf-8")
+    cfg = load_config(config)
+    remote = StreamingRemote(tmp_path, [_selection_item("photo"), _selection_item("after")])
+    video = _selection_item("pending-video", kind="video")
+    backup = tmp_path / "pending-video.mp4"
+    backup.write_bytes(b"original" * 12 + b"1234")
+    import hashlib
+    with StateStore(tmp_path / "state.sqlite", "account", cfg.fingerprint) as state:
+        state.capture_snapshot("pending-video", video, hashlib.sha256(backup.read_bytes()).hexdigest(), backup)
+        pending_output = tmp_path / "pending-video.mp4"
+        pending_output.write_bytes(b"output")
+        state.set_plan("pending-video", 10, 90, pending_output)
+        state.record_upload_intent("pending-video", hashlib.sha256(b"output").hexdigest(), pending_output)
+        result = Pipeline(cfg, remote, state, media=FakeMedia()).run(plan_only=True)
+        row = next(plan for plan in state.rows() if plan["original_id"] == "pending-video")
+    assert result["planned"] == 1
+    assert row["stage"] == "upload_intent"
+    assert remote.yielded == ["photo"]
 
 
 @pytest.mark.parametrize("report_name", [

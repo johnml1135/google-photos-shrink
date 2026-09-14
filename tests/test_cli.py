@@ -91,3 +91,28 @@ def test_keep_originals_flag_is_available_in_help() -> None:
     args = parser.parse_args(["--keep-originals"])
     assert args.keep_originals is True
     assert "keep" in parser.format_help().lower()
+
+
+def test_selection_flags_are_available() -> None:
+    parser = cli._parser()
+    args = parser.parse_args(["--photos-only", "--newest-first"])
+    assert args.photos_only is True
+    assert args.newest_first is True
+
+
+def test_selection_flags_override_run_settings(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = _config(tmp_path)
+    seen: list[dict] = []
+
+    def stop_after_doctor(settings: object) -> int:
+        seen.append(settings.run)
+        return 1
+
+    monkeypatch.setattr(cli, "doctor", stop_after_doctor)
+    assert cli.main([
+        "--config", str(config), "--photos-only", "--newest-first", "--plan-only"
+    ]) == 1
+    assert seen[0]["photos_only"] is True
+    assert seen[0]["selection_order"] == "newest"

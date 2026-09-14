@@ -1,13 +1,15 @@
 """Google Photos remote adapter.
 
 This module contains the small ordinary-dictionary seam consumed by the
-pipeline.  gpwc remains the read/metadata/trash client; Playwright is used only
-for uploads because the pinned gpwc revision intentionally has no upload API.
+pipeline.  gpwc remains the read/metadata/trash client; Playwright is used for
+session refresh and uploads because the pinned gpwc revision intentionally has
+no upload API.
 """
 
 from __future__ import annotations
 
 import base64
+import copy
 import hashlib
 import math
 import mimetypes
@@ -20,12 +22,21 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
 
-from .auth import BrowserAuthenticator, UploadNotStartedError
+from .auth import (
+    BrowserAuthenticator,
+    NetscapeCookie,
+    UploadNotStartedError,
+    write_netscape_cookies,
+)
 from .integrity import sha256_file
 
 
 class RemoteProtocolError(RuntimeError):
     """Raised when an upstream response is missing information we need."""
+
+
+class SessionRefreshError(RemoteProtocolError):
+    """Raised when an authenticated browser/session refresh cannot be installed."""
 
 
 def _asdict(value: Any) -> Any:
@@ -59,6 +70,9 @@ class GooglePhotosRemote:
         self._browser = browser
         self._library_context: dict[str, Any] = {}
         self._trusted_media: set[str] = set()
+        self._upload_in_progress = False
+        self._last_refresh_monotonic = time.monotonic()
+        self._session_refresh_seconds = self._refresh_interval()
 
     def _load_dependencies(self) -> None:
         if self._payloads is None:
@@ -84,22 +98,96 @@ class GooglePhotosRemote:
                 "Chrome Google Photos session to the configured [google].cookies_file."
             )
         if self._client is None:
-            if not self.cookies_file.is_file():
-                raise RemoteProtocolError(
-                    "cookies.txt is missing. Export cookies.txt from your normal Chrome "
-                    "Google Photos session to the configured [google].cookies_file."
-                )
-            try:
-                self._client = self._client_factory(self.cookies_file, account_index=self.account_index)
-            except Exception as exc:  # noqa: BLE001 - upstream session errors vary
-                raise RemoteProtocolError(
-                    "Google session could not be loaded. Export a fresh cookies.txt from "
-                    "your normal Chrome Google Photos session."
-                ) from exc
+            load_error: Exception | None = None
+            if self.cookies_file.is_file():
+                try:
+                    self._client = self._client_factory(self.cookies_file, account_index=self.account_index)
+                except Exception as exc:  # noqa: BLE001 - upstream session errors vary
+                    load_error = exc
+            else:
+                load_error = FileNotFoundError(self.cookies_file)
+            if self._client is None:
+                recovered = self._recover_client_from_browser() if self._session_refresh_seconds > 0 else None
+                if recovered is None:
+                    if isinstance(load_error, FileNotFoundError):
+                        raise RemoteProtocolError(
+                            "cookies.txt is missing. Export cookies.txt from your normal Chrome "
+                            "Google Photos session to the configured [google].cookies_file."
+                        ) from load_error
+                    raise RemoteProtocolError(
+                        "Google session could not be loaded. Export a fresh cookies.txt from "
+                        "your normal Chrome Google Photos session."
+                    ) from load_error
         identity = self.account_id()
         if force and self._browser is not None and self._browser.account_id() != identity:
             raise RemoteProtocolError("browser and gpwc sessions are authenticated to different accounts")
         return identity
+
+    def _recover_client_from_browser(self) -> str | None:
+        if self._browser is None:
+            try:
+                self._browser = BrowserAuthenticator(self.settings)
+            except Exception:
+                return None
+        profile = getattr(self._browser, "profile", None)
+        if profile is None or not Path(profile).is_dir():
+            return None
+        try:
+            browser_identity = self._browser.open(interactive=False, seed_cookies=False)
+            context = getattr(self._browser, "context", None)
+            browser_cookies = context.cookies() if context is not None else None
+            if not isinstance(browser_cookies, list):
+                raise RemoteProtocolError("browser returned malformed cookies")
+            cookies: list[NetscapeCookie] = []
+            for cookie in browser_cookies:
+                if not isinstance(cookie, dict):
+                    raise RemoteProtocolError("browser returned malformed cookies")
+                if not self._is_google_cookie(cookie):
+                    continue
+                domain = cookie.get("domain")
+                name = cookie.get("name")
+                value = cookie.get("value")
+                if not all(isinstance(part, str) and part for part in (domain, name)) or not isinstance(value, str):
+                    raise RemoteProtocolError("browser returned an incomplete cookie")
+                cookies.append(
+                    NetscapeCookie(
+                        domain=domain,
+                        include_subdomains=domain.startswith("."),
+                        path=str(cookie.get("path", "/")),
+                        secure=bool(cookie.get("secure", False)),
+                        expires=int(cookie.get("expires", 0) or 0),
+                        name=name,
+                        value=value,
+                    )
+                )
+            descriptor, temp_name = tempfile.mkstemp(prefix="photos-shrink-browser-", suffix=".txt")
+            os.close(descriptor)
+            temp_path = Path(temp_name)
+            try:
+                write_netscape_cookies(temp_path, cookies)
+                self._client = self._client_factory(temp_path, account_index=self.account_index)
+                self._bound_session_timeout()
+                client_identity = self.account_id()
+                if client_identity != browser_identity:
+                    self._client = None
+                    raise RemoteProtocolError(
+                        "browser and gpwc sessions are authenticated to different accounts"
+                    )
+                if hasattr(self._client, "cookies_txt_path"):
+                    self._client.cookies_txt_path = self.cookies_file
+                return client_identity
+            finally:
+                try:
+                    temp_path.unlink()
+                except OSError as exc:
+                    self._client = None
+                    raise RemoteProtocolError("temporary browser cookie export could not be removed") from exc
+        except RemoteProtocolError:
+            self._client = None
+            raise
+        except Exception as exc:  # noqa: BLE001 - browser/session implementations vary
+            self._client = None
+            raise RemoteProtocolError("Google session could not be recovered from browser profile") from exc
 
     def account_id(self) -> str:
         if self._client is None:
@@ -110,20 +198,186 @@ class GooglePhotosRemote:
             raise RemoteProtocolError("Google Photos returned no stable account identity")
         return str(value)
 
+    def _refresh_interval(self) -> float:
+        value = self.google.get("session_refresh_seconds", 300)
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            return 300.0
+        return max(0.0, float(value))
+
+    @staticmethod
+    def _is_google_cookie(cookie: Any) -> bool:
+        domain = str(cookie.get("domain", "")).lower().lstrip(".") if isinstance(cookie, dict) else ""
+        return domain == "google.com" or domain.endswith(".google.com") or domain == "googleusercontent.com" or domain.endswith(".googleusercontent.com")
+
+    @staticmethod
+    def _cookie_jar_snapshot(jar: Any) -> Any:
+        try:
+            return copy.deepcopy(jar)
+        except Exception:
+            return jar.copy() if callable(getattr(jar, "copy", None)) else None
+
+    @staticmethod
+    def _restore_cookie_jar(jar: Any, snapshot: Any) -> None:
+        if snapshot is None:
+            return
+        try:
+            jar.clear()
+            jar.update(snapshot)
+        except (AttributeError, TypeError):
+            return
+
+    def _merge_browser_cookies(self, jar: Any, cookies: list[dict[str, Any]]) -> None:
+        for cookie in list(jar):
+            if self._is_google_cookie({"domain": getattr(cookie, "domain", "")}):
+                try:
+                    jar.clear(cookie.domain, cookie.path, cookie.name)
+                except (AttributeError, KeyError):
+                    pass
+        for cookie in cookies:
+            if not self._is_google_cookie(cookie):
+                continue
+            name = cookie.get("name")
+            value = cookie.get("value")
+            domain = cookie.get("domain")
+            if not all(isinstance(value, str) and value for value in (name, domain)) or not isinstance(value, str):
+                raise SessionRefreshError("browser returned an incomplete Google cookie")
+            kwargs: dict[str, Any] = {
+                "domain": domain,
+                "path": str(cookie.get("path", "/")),
+                "secure": bool(cookie.get("secure", False)),
+            }
+            if cookie.get("expires") not in (None, 0, -1):
+                kwargs["expires"] = cookie["expires"]
+            try:
+                jar.set(name, value, **kwargs)
+            except (AttributeError, TypeError) as exc:
+                raise SessionRefreshError("Google client cookie jar cannot accept browser cookies") from exc
+
+    def refresh_session(self) -> None:
+        """Refresh browser authentication and atomically install it in gpwc."""
+
+        if self._upload_in_progress:
+            return
+        try:
+            self._load_dependencies()
+            if self._client is None:
+                self.login()
+        except SessionRefreshError:
+            raise
+        except Exception as exc:  # noqa: BLE001 - dependency/session failures vary
+            raise SessionRefreshError("Google Photos session refresh could not initialize") from exc
+        if self._client is None:
+            raise SessionRefreshError("Google client is not initialized")
+        self._bound_session_timeout()
+        session = getattr(self._client, "session", None)
+        jar = getattr(session, "cookies", None)
+        if jar is None:
+            raise SessionRefreshError("Google client has no cookie jar")
+        old_cookies = self._cookie_jar_snapshot(jar)
+        old_global_data = copy.deepcopy(getattr(self._client, "global_data", None))
+        try:
+            if self._browser is None:
+                self._browser = BrowserAuthenticator(self.settings)
+            expected_account = self.account_id()
+            refresh = getattr(self._browser, "refresh_session", None)
+            if callable(refresh):
+                browser_cookies = refresh(expected_account)
+            else:
+                browser_identity = self._browser.open(interactive=False)
+                if browser_identity != expected_account:
+                    raise SessionRefreshError("browser and gpwc sessions are authenticated to different accounts")
+                context = getattr(self._browser, "context", None)
+                browser_cookies = context.cookies() if context is not None else []
+            if not isinstance(browser_cookies, list) or any(not isinstance(cookie, dict) for cookie in browser_cookies):
+                raise SessionRefreshError("browser returned malformed cookies")
+            self._merge_browser_cookies(jar, browser_cookies)
+            get_global_data = getattr(self._client, "get_global_data", None)
+            if not callable(get_global_data):
+                raise SessionRefreshError("Google client cannot refresh request tokens")
+            fresh_global_data = get_global_data()
+            required = ("oPEP7c", "FdrFJe", "cfb2h", "SNlM0e", "Im6cmf")
+            if not isinstance(fresh_global_data, dict) or any(not fresh_global_data.get(key) for key in required):
+                raise SessionRefreshError("Google Photos returned incomplete session request tokens")
+            if str(fresh_global_data["oPEP7c"]) != expected_account:
+                raise SessionRefreshError("Google Photos refresh returned a different account")
+            self._client.global_data = fresh_global_data
+            self._last_refresh_monotonic = time.monotonic()
+        except SessionRefreshError:
+            self._restore_cookie_jar(jar, old_cookies)
+            self._client.global_data = old_global_data
+            raise
+        except Exception as exc:  # noqa: BLE001 - browser/upstream implementations vary
+            self._restore_cookie_jar(jar, old_cookies)
+            self._client.global_data = old_global_data
+            raise SessionRefreshError("Google Photos session refresh failed") from exc
+
+    def _maybe_refresh(self) -> None:
+        if self._upload_in_progress or self._session_refresh_seconds <= 0:
+            return
+        if not self._refresh_due():
+            return
+        self.refresh_session()
+
+    def _refresh_due(self) -> bool:
+        return (
+            self._session_refresh_seconds > 0
+            and time.monotonic() - self._last_refresh_monotonic >= self._session_refresh_seconds
+        )
+
+    @staticmethod
+    def _is_read_only(payload: Any) -> bool:
+        return type(payload).__name__ in {
+            "GetLibraryPageByTakenDate",
+            "GetItemInfo",
+            "GetItemInfoExt",
+            "GetRemoteMatchesByHash",
+        }
+
+    @staticmethod
+    def _request_name(payload: Any) -> str:
+        return str(getattr(payload, "rpcid", None) or type(payload).__name__)
+
+    def _request(self, payload: Any) -> Any:
+        rpc_name = self._request_name(payload)
+        try:
+            response = self._client.send_api_request(payload)
+        except Exception as exc:
+            status = getattr(exc, "status_code", None)
+            if status is None:
+                status = getattr(getattr(exc, "response", None), "status_code", None)
+            suffix = f" status={status}" if status is not None else ""
+            raise RemoteProtocolError(f"Google Photos request failed rpc={rpc_name}{suffix}") from exc
+        if not getattr(response, "success", False):
+            status = getattr(response, "status_code", None)
+            suffix = f" status={status}" if status is not None else ""
+            raise RemoteProtocolError(f"Google Photos returned an unsuccessful response rpc={rpc_name}{suffix}")
+        data = getattr(response, "data", None)
+        if data is None:
+            raise RemoteProtocolError(f"Google Photos returned an empty response rpc={rpc_name}")
+        return data
+
+    def register_replacements(self, ids: Iterable[str]) -> None:
+        """Trust replacement IDs recovered from the newest journal state."""
+
+        for media_id in ids:
+            if isinstance(media_id, str) and media_id:
+                self._trusted_media.add(media_id)
+
     def _execute(self, payload: Any) -> Any:
         if self._client is None:
             self.login()
         self._bound_session_timeout()
+        self._maybe_refresh()
         try:
-            response = self._client.send_api_request(payload)
-        except Exception as exc:
-            raise RemoteProtocolError("Google Photos request failed") from exc
-        if not getattr(response, "success", False):
-            raise RemoteProtocolError("Google Photos returned an unsuccessful response")
-        data = getattr(response, "data", None)
-        if data is None:
-            raise RemoteProtocolError("Google Photos returned an empty response")
-        return data
+            return self._request(payload)
+        except RemoteProtocolError:
+            if not self._is_read_only(payload) or self._upload_in_progress or self._session_refresh_seconds <= 0:
+                raise
+            try:
+                self.refresh_session()
+            except SessionRefreshError:
+                raise
+            return self._request(payload)
 
     def _bound_session_timeout(self) -> None:
         """Give gpwc's requests session a finite API timeout."""
@@ -176,6 +430,8 @@ class GooglePhotosRemote:
                 self._library_context[media_key] = library_item
                 try:
                     yield self._item_for_media(media_key, library_item)
+                except SessionRefreshError:
+                    raise
                 except RemoteProtocolError as exc:
                     # A malformed item must be visible to the planner and can
                     # never be interpreted as a candidate for deletion.
@@ -379,6 +635,9 @@ class GooglePhotosRemote:
             return response
         except Exception as exc:
             status = getattr(locals().get("response"), "status_code", None)
+            close = getattr(locals().get("response"), "close", None)
+            if callable(close):
+                close()
             if status is not None:
                 raise RemoteProtocolError(f"original download request failed (status={status})") from exc
             raise RemoteProtocolError("original download request failed") from exc
@@ -404,19 +663,25 @@ class GooglePhotosRemote:
             if not isinstance(url, str):
                 raise RemoteProtocolError("refreshed item has no original download URL")
             response = self._session_get(url, stream=True)
-        headers = getattr(response, "headers", {}) or {}
-        if not isinstance(headers, dict) and not callable(getattr(headers, "get", None)):
-            raise RemoteProtocolError("original download returned malformed headers")
-        content_type = str(headers.get("content-type", "")).lower()
-        if "text/html" in content_type or "application/json" in content_type:
-            raise RemoteProtocolError("original download returned a non-media response")
-        content_length = headers.get("content-length")
-        if content_length and isinstance(expected_size, int):
-            try:
-                if int(content_length) != expected_size:
-                    raise RemoteProtocolError("original download size does not match metadata")
-            except ValueError as exc:
-                raise RemoteProtocolError("original download size is malformed") from exc
+        try:
+            headers = getattr(response, "headers", {}) or {}
+            if not isinstance(headers, dict) and not callable(getattr(headers, "get", None)):
+                raise RemoteProtocolError("original download returned malformed headers")
+            content_type = str(headers.get("content-type", "")).lower()
+            if "text/html" in content_type or "application/json" in content_type:
+                raise RemoteProtocolError("original download returned a non-media response")
+            content_length = headers.get("content-length")
+            if content_length and isinstance(expected_size, int):
+                try:
+                    if int(content_length) != expected_size:
+                        raise RemoteProtocolError("original download size does not match metadata")
+                except ValueError as exc:
+                    raise RemoteProtocolError("original download size is malformed") from exc
+        except Exception:
+            close = getattr(response, "close", None)
+            if callable(close):
+                close()
+            raise
         target = Path(destination)
         target.parent.mkdir(parents=True, exist_ok=True)
         fd, temp_name = tempfile.mkstemp(prefix=f".{target.name}.", dir=target.parent)
@@ -506,6 +771,30 @@ class GooglePhotosRemote:
                     "Google Photos changed uploaded bytes; select Original quality and retry"
                 )
 
+    def ensure_upload_quality(self) -> None:
+        """Explicitly select Original quality in the active browser account."""
+
+        if self._browser is None:
+            try:
+                self._browser = BrowserAuthenticator(self.settings)
+            except Exception as exc:  # noqa: BLE001 - browser setup varies by environment
+                raise RemoteProtocolError("browser upload setup failed") from exc
+        try:
+            client_identity = self.account_id()
+            browser_identity = self._browser.open(interactive=False)
+            if browser_identity != client_identity:
+                raise RemoteProtocolError(
+                    "browser and gpwc sessions are authenticated to different accounts"
+                )
+            ensure = getattr(self._browser, "ensure_original_quality", None)
+            if not callable(ensure):
+                raise RemoteProtocolError("Original quality control is unavailable")
+            ensure(client_identity)
+        except RemoteProtocolError:
+            raise
+        except Exception as exc:  # noqa: BLE001 - browser/UI failures vary
+            raise RemoteProtocolError("Original quality could not be enabled") from exc
+
     def upload(self, path: str | os.PathLike[str]) -> dict[str, Any]:
         file_path = Path(path)
         if not file_path.is_file() or file_path.stat().st_size == 0:
@@ -523,6 +812,12 @@ class GooglePhotosRemote:
             raise
         except Exception as exc:  # noqa: BLE001 - session failures vary by upstream
             raise UploadNotStartedError("Google account check failed before upload") from exc
+        if self._refresh_due() and callable(getattr(self._browser, "refresh_session", None)):
+            try:
+                self.refresh_session()
+                client_identity = self.account_id()
+            except Exception as exc:  # noqa: BLE001 - browser/session failures vary
+                raise UploadNotStartedError("Google session refresh failed before upload") from exc
         try:
             browser_identity = self._browser.open(interactive=False)
         except UploadNotStartedError:
@@ -531,28 +826,51 @@ class GooglePhotosRemote:
             raise UploadNotStartedError("browser session could not be opened") from exc
         if browser_identity != client_identity:
             raise UploadNotStartedError("browser and gpwc sessions are authenticated to different accounts")
-        self._browser.upload(file_path)
-        timeout = float(self.google.get("upload_timeout_seconds", 120))
-        poll_seconds = float(self.google.get("upload_poll_seconds", 1))
-        deadline = time.monotonic() + timeout
-        while time.monotonic() < deadline:
-            match = self.find_uploaded(file_path)
-            if match is not None:
-                self._trusted_media.add(match["id"])
-                try:
-                    verified = self.get_item(match["id"])
-                except RemoteProtocolError:
-                    verified = match
-                if verified.get("size_bytes") != file_path.stat().st_size:
-                    raise RemoteProtocolError("uploaded item size does not match local bytes")
-                expected_sha = self._sha256(file_path)
-                if verified.get("is_original_quality") is not True:
-                    self._verify_remote_bytes(verified, expected_sha)
-                verified["content_hash"] = match.get("content_hash")
-                verified["sha256"] = expected_sha
-                return verified
-            time.sleep(min(poll_seconds, max(0, deadline - time.monotonic())))
-        raise RemoteProtocolError("uploaded item could not be resolved by exact content hash")
+        if bool(self.google.get("auto_original_quality", True)):
+            try:
+                ensure = getattr(self._browser, "ensure_original_quality", None)
+                if not callable(ensure):
+                    raise UploadNotStartedError("Original quality control is unavailable")
+                ensure(client_identity)
+            except UploadNotStartedError:
+                raise
+            except Exception as exc:  # noqa: BLE001 - browser/UI failures vary
+                raise UploadNotStartedError("Original quality preflight failed") from exc
+        self._upload_in_progress = True
+        try:
+            self._browser.upload(file_path)
+            timeout = float(self.google.get("upload_timeout_seconds", 120))
+            poll_seconds = float(self.google.get("upload_poll_seconds", 1))
+            readiness_poll_seconds = max(poll_seconds, 3.0)
+            deadline = time.monotonic() + timeout
+            expected_sha = self._sha256(file_path)
+            match = None
+            last_readiness_error: RemoteProtocolError | None = None
+            while time.monotonic() < deadline:
+                if match is None:
+                    try:
+                        match = self.find_uploaded(file_path)
+                    except RemoteProtocolError as exc:
+                        last_readiness_error = exc
+                if match is not None:
+                    self._trusted_media.add(match["id"])
+                    try:
+                        verified = self.get_item(match["id"])
+                        if verified.get("size_bytes") != file_path.stat().st_size:
+                            raise RemoteProtocolError("uploaded item size does not match local bytes")
+                        self._verify_remote_bytes(verified, expected_sha)
+                        verified["content_hash"] = match.get("content_hash")
+                        verified["sha256"] = expected_sha
+                        return verified
+                    except RemoteProtocolError as exc:
+                        last_readiness_error = exc
+                wait_seconds = readiness_poll_seconds if match is not None else poll_seconds
+                time.sleep(min(wait_seconds, max(0, deadline - time.monotonic())))
+            if last_readiness_error is not None:
+                raise RemoteProtocolError(f"uploaded item readiness timed out: {last_readiness_error}") from last_readiness_error
+            raise RemoteProtocolError("uploaded item could not be resolved by exact content hash")
+        finally:
+            self._upload_in_progress = False
 
     def restore_metadata(self, original: dict[str, Any], replacement: dict[str, Any]) -> None:
         dedup = replacement.get("dedup_key")

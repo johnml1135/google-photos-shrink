@@ -47,6 +47,9 @@ class Pipeline:
         self.work_dir = Path(settings.run["work_dir"]).resolve()
         self.work_dir.mkdir(parents=True, exist_ok=True)
         self._output_ids: set[str] = {str(row["replacement_id"]) for row in self.state.rows() if row.get("replacement_id")}
+        register_replacements = getattr(self.remote, "register_replacements", None)
+        if callable(register_replacements):
+            register_replacements(self._output_ids)
 
     def _item_dir(self, item_id: str) -> Path:
         # IDs are untrusted: a digest gives a stable path below work_dir.
@@ -57,6 +60,8 @@ class Pipeline:
     def _skip_reason(self, item: dict[str, Any]) -> str | None:
         if item.get("skip_reason"):
             return str(item["skip_reason"])
+        if self.settings.run.get("photos_only", False) and item.get("kind") != "photo":
+            return "non_photo"
         if self.settings.run["skip_shared"]:
             albums = (item.get("metadata") or {}).get("albums") or []
             if any(bool(album.get("shared")) for album in albums if isinstance(album, dict)):
@@ -70,6 +75,28 @@ class Pipeline:
 
     def _is_output(self, item_id: str) -> bool:
         return str(item_id) in self._output_ids
+
+    def _protect_pending_upload(self, plan: dict[str, Any], row: dict[str, Any]) -> None:
+        """Resolve a pending upload's exact remote object before inventory."""
+        find_uploaded = getattr(self.remote, "find_uploaded", None)
+        if not callable(find_uploaded):
+            return
+        try:
+            self._local_output_info(plan, row)
+        except PipelineError:
+            raise
+        except Exception as exc:  # noqa: BLE001 - fail closed on any local verification failure
+            raise PipelineError(
+                f"pending upload output cannot be verified for {plan['item'].get('id')}: {exc}"
+            ) from exc
+        found = find_uploaded(plan["output"])
+        if found is None:
+            return
+        replacement_id = found.get("id")
+        if not replacement_id:
+            raise PipelineError("reconciled upload did not contain an item id")
+        self._check_identity(plan["item"], found)
+        self._output_ids.add(str(replacement_id))
 
     def _download_backup(self, item: dict[str, Any], directory: Path) -> tuple[Path, str]:
         filename = _safe_filename(item.get("filename", "item"))
@@ -321,6 +348,10 @@ class Pipeline:
                 raise PipelineError("upload response did not contain an item id")
             self._check_identity(item, replacement)
             self.state.mark_uploaded(item_id, replacement_id, row["output_hash"])
+            register_replacements = getattr(self.remote, "register_replacements", None)
+            if callable(register_replacements):
+                register_replacements([str(replacement_id)])
+            plan["output_info"] = output_info
         else:
             encode_settings = {**self.settings.as_dict(), "source_metadata": item.get("metadata") or {}}
             output_info = self.media.encode(plan["backup"], plan["output"], encode_settings)
@@ -380,40 +411,43 @@ class Pipeline:
             report_path: str | Path | None = None, keep_originals: bool = False) -> dict[str, Any]:
         report = Path(report_path or self.work_dir / "photos-shrink.csv").expanduser().resolve()
         self._validate_report_path(report)
-        self.progress("Scanning Google Photos...")
-        items: list[dict[str, Any]] = []
-        for index, item in enumerate(self.remote.list_items(), 1):
-            items.append(item)
-            if index % 25 == 0:
-                self.progress(f"Inventory: scanned {index} items")
-        self.progress(f"Inventory: {len(items)} items")
         plans: list[dict[str, Any]] = []
         pending_ids: set[str] = set()
         terminal_ids: set[str] = set()
-        # Live listing can omit originals already trashed or an item that crashed after upload.
+        # Load resumable work before inventory so it participates in the limit and
+        # can avoid an unnecessary remote listing altogether.
         for row in self.state.rows():
             if row.get("stage") in {"upload_intent", "uploaded", "trash_ready"}:
                 plan = self._resume_plan(row)
+                if row.get("stage") == "upload_intent":
+                    self._protect_pending_upload(plan, row)
                 plans.append(plan)
                 pending_ids.add(str(row["original_id"]))
             elif row.get("stage") == "trashed":
                 terminal_ids.add(str(row["original_id"]))
         limit = int(self.settings.run.get("limit", 0))
-        eligible = sum(plan["status"] == "planned" for plan in plans)
-        for item in sorted(items, key=lambda value: int(value.get("size_bytes") or 0), reverse=True):
+        count_toward_limit = {"planned", "pending_reconcile"}
+        planned_count = sum(plan["status"] in count_toward_limit for plan in plans)
+
+        def record_skip(item: dict[str, Any], reason: str) -> None:
+            item_id = str(item["id"])
+            self.state.mark_skipped(item_id, item, reason)
+            plans.append({"item": item, "old_size": item.get("size_bytes"), "estimated_size": None,
+                          "estimated_savings": None, "old_path": "", "new_path": "", "status": "skipped",
+                          "reason": reason, "estimate_method": ""})
+            self._write_report(plans, report)
+
+        def plan_item(item: dict[str, Any]) -> None:
+            nonlocal planned_count
             item_id = str(item.get("id", ""))
             if not item_id or item_id in pending_ids or item_id in terminal_ids or self._is_output(item_id):
-                continue
+                return
             reason = self._skip_reason(item)
             if reason:
-                self.state.mark_skipped(item_id, item, reason)
-                plans.append({"item": item, "old_size": item.get("size_bytes"), "estimated_size": None,
-                              "estimated_savings": None, "old_path": "", "new_path": "", "status": "skipped",
-                              "reason": reason, "estimate_method": ""})
-                self._write_report(plans, report)
-                continue
-            if limit and eligible >= limit:
-                continue
+                record_skip(item, reason)
+                return
+            if limit and planned_count >= limit:
+                return
             self.progress(f"Planning {item.get('filename', item_id)}")
             try:
                 plan = self._build_plan(item)
@@ -424,11 +458,38 @@ class Pipeline:
                               "estimated_savings": None, "old_path": "", "new_path": "", "status": "skipped",
                               "reason": error_reason, "estimate_method": ""})
                 self._write_report(plans, report)
-                continue
+                return
             plans.append(plan)
-            if plan["status"] == "planned":
-                eligible += 1
+            if plan["status"] in count_toward_limit:
+                planned_count += 1
             self._write_report(plans, report)
+
+        if not (limit and planned_count >= limit):
+            selection_order = self.settings.run.get("selection_order", "largest")
+            self.progress("Scanning Google Photos...")
+            listing = self.remote.list_items()
+            try:
+                if selection_order == "newest":
+                    scanned = 0
+                    for item in listing:
+                        scanned += 1
+                        self.progress(f"Inventory: scanned {scanned} items")
+                        plan_item(item)
+                        if limit and planned_count >= limit:
+                            break
+                    self.progress(f"Inventory: {scanned} items")
+                else:
+                    items: list[dict[str, Any]] = []
+                    for item in listing:
+                        items.append(item)
+                        self.progress(f"Inventory: scanned {len(items)} items")
+                    self.progress(f"Inventory: {len(items)} items")
+                    for item in sorted(items, key=lambda value: int(value.get("size_bytes") or 0), reverse=True):
+                        plan_item(item)
+            finally:
+                close_listing = getattr(listing, "close", None)
+                if callable(close_listing):
+                    close_listing()
         self._write_report(plans, report)
         result = {"planned": sum(plan["status"] == "planned" for plan in plans), "report": str(report),
                   "replaced": 0, "verified": 0, "awaiting_confirmation": False}

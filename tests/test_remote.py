@@ -7,8 +7,13 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
+import requests
 
-from photos_shrink.auth import UploadNotStartedError
+from photos_shrink.auth import (
+    BrowserAuthError,
+    UploadNotStartedError,
+    load_netscape_cookies,
+)
 from photos_shrink.remote import GooglePhotosRemote, RemoteProtocolError
 
 
@@ -129,6 +134,318 @@ def test_login_without_cookies_explains_normal_chrome_export(tmp_path):
     assert calls == []
 
 
+def test_login_recovers_from_existing_browser_profile_without_overwriting_seed(tmp_path):
+    configured = settings(tmp_path)
+    cookie_file = Path(configured["google"]["cookies_file"])
+    cookie_file.write_text("manual seed\n", encoding="utf-8")
+    profile = Path(configured["google"]["browser_profile"])
+    profile.mkdir()
+    created_from = []
+
+    class Context:
+        def cookies(self):
+            return [{"name": "SID", "value": "fresh", "domain": ".google.com", "path": "/"}]
+
+    browser_profile = profile
+
+    class Browser:
+        profile = browser_profile
+        context = Context()
+
+        def open(self, *, interactive=False, seed_cookies=True):
+            assert interactive is False
+            assert seed_cookies is False
+            return "stable-account"
+
+    def factory(path, **kwargs):
+        temp_path = Path(path)
+        if temp_path == cookie_file:
+            raise ValueError("expired seed")
+        assert temp_path != cookie_file
+        assert temp_path.is_file()
+        created_from.append((temp_path, load_netscape_cookies(temp_path)))
+        client = Client()
+        client.cookies_txt_path = temp_path
+        return client
+
+    remote = GooglePhotosRemote(configured, client_factory=factory, payloads=Payloads, browser=Browser())
+    assert remote.login() == "stable-account"
+    assert cookie_file.read_text(encoding="utf-8") == "manual seed\n"
+    assert len(created_from) == 1
+    assert not created_from[0][0].exists()
+    assert remote._client.cookies_txt_path == cookie_file
+    assert remote._browser is not None
+
+
+def test_login_profile_recovery_rejects_account_mismatch_and_cleans_temp(tmp_path):
+    configured = settings(tmp_path)
+    cookie_file = Path(configured["google"]["cookies_file"])
+    cookie_file.write_text("manual seed\n", encoding="utf-8")
+    profile = Path(configured["google"]["browser_profile"])
+    profile.mkdir()
+    temp_paths = []
+
+    class Context:
+        def cookies(self):
+            return [{"name": "SID", "value": "fresh", "domain": ".google.com", "path": "/"}]
+
+    browser_profile = profile
+
+    class Browser:
+        profile = browser_profile
+        context = Context()
+
+        def open(self, *, interactive=False, seed_cookies=True):
+            return "browser-account"
+
+    def factory(path, **kwargs):
+        if Path(path) == cookie_file:
+            raise ValueError("expired seed")
+        temp_paths.append(Path(path))
+        client = Client()
+        client.global_data["oPEP7c"] = "other-account"
+        return client
+
+    remote = GooglePhotosRemote(configured, client_factory=factory, payloads=Payloads, browser=Browser())
+    with pytest.raises(RemoteProtocolError, match="different accounts"):
+        remote.login()
+    assert cookie_file.read_text(encoding="utf-8") == "manual seed\n"
+    assert len(temp_paths) == 1
+    assert not temp_paths[0].exists()
+
+
+def test_login_does_not_use_profile_recovery_when_refresh_is_disabled(tmp_path):
+    configured = settings(tmp_path)
+    configured["google"]["session_refresh_seconds"] = 0
+    profile = Path(configured["google"]["browser_profile"])
+    profile.mkdir()
+    browser_calls = []
+
+    browser_profile = profile
+
+    class Browser:
+        profile = browser_profile
+
+        def open(self, **kwargs):
+            browser_calls.append(kwargs)
+            return "stable-account"
+
+    remote = GooglePhotosRemote(configured, client_factory=lambda *args, **kwargs: Client(), payloads=Payloads, browser=Browser())
+    with pytest.raises(RemoteProtocolError, match="cookies.txt"):
+        remote.login()
+    assert browser_calls == []
+
+
+def test_login_profile_recovery_fails_if_temporary_cookie_export_cannot_be_removed(tmp_path, monkeypatch):
+    configured = settings(tmp_path)
+    cookie_file = Path(configured["google"]["cookies_file"])
+    cookie_file.write_text("manual seed\n", encoding="utf-8")
+    profile = Path(configured["google"]["browser_profile"])
+    profile.mkdir()
+    browser_profile = profile
+    temp_paths = []
+
+    class Context:
+        def cookies(self):
+            return [{"name": "SID", "value": "fresh", "domain": ".google.com", "path": "/"}]
+
+    class Browser:
+        profile = browser_profile
+        context = Context()
+
+        def open(self, **kwargs):
+            return "stable-account"
+
+    def factory(path, **kwargs):
+        if Path(path) == cookie_file:
+            raise ValueError("expired seed")
+        temp_paths.append(Path(path))
+        return Client()
+
+    original_unlink = Path.unlink
+
+    def fail_temp_unlink(path, *args, **kwargs):
+        if path.name.startswith("photos-shrink-browser-"):
+            raise OSError("busy")
+        return original_unlink(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "unlink", fail_temp_unlink)
+    remote = GooglePhotosRemote(configured, client_factory=factory, payloads=Payloads, browser=Browser())
+    with pytest.raises(RemoteProtocolError, match="temporary browser cookie export"):
+        remote.login()
+    assert len(temp_paths) == 1
+    original_unlink(temp_paths[0])
+
+
+class GetItemInfo:
+    rpcid = "refresh-read"
+
+
+class MutatingPayload:
+    rpcid = "refresh-write"
+
+
+class RefreshSession:
+    def __init__(self):
+        self.cookies = requests.cookies.RequestsCookieJar()
+        self.cookies.set("SID", "stale", domain=".google.com", path="/")
+        self.cookies.set("OLD", "stale", domain="accounts.google.com", path="/")
+        self.cookies.set("keep", "value", domain="example.test", path="/")
+
+
+class RefreshClient(Client):
+    def __init__(self):
+        super().__init__()
+        self.session = RefreshSession()
+        self.global_data = {
+            "oPEP7c": "stable-account",
+            "FdrFJe": "old-fsid",
+            "cfb2h": "old-bl",
+            "SNlM0e": "old-at",
+            "Im6cmf": "/_ /old".replace(" ", ""),
+        }
+        self.global_calls = 0
+
+    def get_global_data(self):
+        self.global_calls += 1
+        return {
+            "oPEP7c": "stable-account",
+            "FdrFJe": "new-fsid",
+            "cfb2h": "new-bl",
+            "SNlM0e": "new-at",
+            "Im6cmf": "/_ /new".replace(" ", ""),
+        }
+
+
+def test_refresh_propagates_browser_google_cookies_and_request_tokens(tmp_path):
+    class Browser:
+        def refresh_session(self, expected_account):
+            assert expected_account == "stable-account"
+            return [{"name": "SID", "value": "fresh", "domain": ".google.com", "path": "/"}]
+
+    client = RefreshClient()
+    remote = GooglePhotosRemote(settings(tmp_path), client=client, payloads=Payloads, browser=Browser())
+    remote.refresh_session()
+
+    assert client.session.cookies.get("SID", domain=".google.com", path="/") == "fresh"
+    assert client.session.cookies.get("OLD", domain="accounts.google.com", path="/") is None
+    assert client.session.cookies.get("keep", domain="example.test", path="/") == "value"
+    assert client.global_data["FdrFJe"] == "new-fsid"
+    assert client.global_data["SNlM0e"] == "new-at"
+
+
+def test_refresh_rolls_back_cookiejar_and_global_data_on_identity_mismatch(tmp_path):
+    class Browser:
+        def refresh_session(self, expected_account):
+            return [{"name": "SID", "value": "fresh", "domain": ".google.com", "path": "/"}]
+
+    client = RefreshClient()
+    client.get_global_data = lambda: {
+        "oPEP7c": "other-account",
+        "FdrFJe": "new-fsid",
+        "cfb2h": "new-bl",
+        "SNlM0e": "new-at",
+        "Im6cmf": "/new",
+    }
+    old_global = dict(client.global_data)
+    remote = GooglePhotosRemote(settings(tmp_path), client=client, payloads=Payloads, browser=Browser())
+    with pytest.raises(RemoteProtocolError, match="account"):
+        remote.refresh_session()
+
+    assert dict(client.global_data) == old_global
+    assert client.session.cookies.get("SID", domain=".google.com", path="/") == "stale"
+
+
+def test_execute_periodically_refreshes_before_read(tmp_path, monkeypatch):
+    client = Client()
+    remote = GooglePhotosRemote(
+        {**settings(tmp_path), "google": {**settings(tmp_path)["google"], "session_refresh_seconds": 10}},
+        client=client,
+        payloads=Payloads,
+    )
+    remote._last_refresh_monotonic = 0
+    now = [100.0]
+    monkeypatch.setattr("photos_shrink.remote.time.monotonic", lambda: now[0])
+    calls = []
+
+    def refresh():
+        calls.append("refresh")
+        remote._last_refresh_monotonic = now[0]
+
+    monkeypatch.setattr(remote, "refresh_session", refresh)
+    client.responses[GetItemInfo] = type("R", (), {"success": True, "data": object()})()
+    remote._execute(GetItemInfo())
+    assert calls == ["refresh"]
+
+
+def test_execute_retries_a_failed_read_once_after_refresh(tmp_path, monkeypatch):
+    client = Client()
+    remote = GooglePhotosRemote(settings(tmp_path), client=client, payloads=Payloads)
+    calls = []
+
+    def send(payload):
+        calls.append(type(payload))
+        if len(calls) == 1:
+            raise RuntimeError("temporary")
+        return type("R", (), {"success": True, "data": object()})()
+
+    client.send_api_request = send
+    refreshes = []
+    monkeypatch.setattr(remote, "refresh_session", lambda: refreshes.append(True))
+    assert remote._execute(GetItemInfo()) is not None
+    assert len(calls) == 2
+    assert refreshes == [True]
+
+
+def test_execute_does_not_retry_mutating_request(tmp_path, monkeypatch):
+    client = Client()
+    remote = GooglePhotosRemote(settings(tmp_path), client=client, payloads=Payloads)
+    calls = []
+
+    def send(payload):
+        calls.append(payload)
+        raise RuntimeError("temporary")
+
+    client.send_api_request = send
+    refreshes = []
+    monkeypatch.setattr(remote, "refresh_session", lambda: refreshes.append(True))
+    with pytest.raises(RemoteProtocolError, match="refresh-write"):
+        remote._execute(MutatingPayload())
+    assert len(calls) == 1
+    assert refreshes == []
+
+
+def test_zero_refresh_interval_disables_failure_retry(tmp_path, monkeypatch):
+    configured = settings(tmp_path)
+    configured["google"]["session_refresh_seconds"] = 0
+    client = Client()
+    remote = GooglePhotosRemote(configured, client=client, payloads=Payloads)
+    calls = []
+
+    def send(payload):
+        calls.append(payload)
+        raise RuntimeError("temporary")
+
+    client.send_api_request = send
+    refreshes = []
+    monkeypatch.setattr(remote, "refresh_session", lambda: refreshes.append(True))
+    with pytest.raises(RemoteProtocolError):
+        remote._execute(GetItemInfo())
+    assert len(calls) == 1
+    assert refreshes == []
+
+
+def test_execute_skips_refresh_while_upload_is_active(tmp_path, monkeypatch):
+    client = Client()
+    remote = GooglePhotosRemote(settings(tmp_path), client=client, payloads=Payloads)
+    remote._upload_in_progress = True
+    refreshes = []
+    monkeypatch.setattr(remote, "refresh_session", lambda: refreshes.append(True))
+    client.responses[GetItemInfo] = type("R", (), {"success": True, "data": object()})()
+    remote._execute(GetItemInfo())
+    assert refreshes == []
+
+
 def test_small_run_limit_requests_a_small_initial_library_page(tmp_path):
     configured = settings(tmp_path)
     configured["run"] = {"limit": 3}
@@ -205,6 +522,26 @@ def test_download_refuses_success_response_that_is_not_original(tmp_path):
     assert not destination.exists()
 
 
+def test_download_closes_response_when_headers_are_invalid(tmp_path):
+    destination = tmp_path / "original.jpg"
+
+    class ClosableResponse(Response):
+        def __init__(self):
+            super().__init__(content=b"login html", headers={"content-type": "text/html"})
+            self.closed = 0
+
+        def close(self):
+            self.closed += 1
+
+    response = ClosableResponse()
+    remote = GooglePhotosRemote(settings(tmp_path), client=Client(response), payloads=Payloads)
+
+    with pytest.raises(RemoteProtocolError):
+        remote.download({"id": "x", "metadata": {}, "original_url": "https://example.test/original"}, destination)
+
+    assert response.closed == 1
+
+
 def test_trash_fails_closed_when_item_identity_or_metadata_is_uncertain(tmp_path):
     client = Client()
     remote = GooglePhotosRemote(settings(tmp_path), client=client, payloads=Payloads)
@@ -230,6 +567,48 @@ def test_upload_refuses_browser_session_for_a_different_account(tmp_path):
 
     with pytest.raises(UploadNotStartedError, match="different accounts"):
         GooglePhotosRemote(settings(tmp_path), client=Client(), payloads=Payloads, browser=Browser()).upload(path)
+
+
+def test_upload_quality_preflight_failure_prevents_file_submission(tmp_path):
+    path = tmp_path / "encoded.jpg"
+    path.write_bytes(b"encoded bytes")
+    calls = []
+
+    class Browser:
+        def open(self, *, interactive=False):
+            return "stable-account"
+
+        def ensure_original_quality(self, expected_account):
+            calls.append(expected_account)
+            raise BrowserAuthError("Original quality control is unavailable")
+
+        def upload(self, path):
+            raise AssertionError("upload must not start when quality preflight fails")
+
+        def close(self):
+            pass
+
+    configured = settings(tmp_path)
+    configured["google"]["auto_original_quality"] = True
+    with pytest.raises(UploadNotStartedError, match="quality preflight"):
+        GooglePhotosRemote(configured, client=Client(), payloads=Payloads, browser=Browser()).upload(path)
+    assert calls == ["stable-account"]
+
+
+def test_explicit_ensure_upload_quality_uses_current_browser_account(tmp_path):
+    calls = []
+
+    class Browser:
+        def open(self, *, interactive=False):
+            calls.append(("open", interactive))
+            return "stable-account"
+
+        def ensure_original_quality(self, expected_account):
+            calls.append(("quality", expected_account))
+
+    remote = GooglePhotosRemote(settings(tmp_path), client=Client(), payloads=Payloads, browser=Browser())
+    remote.ensure_upload_quality()
+    assert calls == [("open", False), ("quality", "stable-account")]
 
 
 @pytest.mark.parametrize("failure", ["construct", "account", "open"])
@@ -259,6 +638,94 @@ def test_upload_pre_submission_failures_are_retryable(tmp_path, monkeypatch, fai
     monkeypatch.setattr("photos_shrink.remote.BrowserAuthenticator", Browser)
     with pytest.raises(UploadNotStartedError):
         GooglePhotosRemote(settings(tmp_path), client=client, payloads=Payloads).upload(path)
+
+
+def _upload_remote(tmp_path, *, timeout=0.05, poll=0.001):
+    path = tmp_path / "encoded.jpg"
+    path.write_bytes(b"encoded")
+
+    class Browser:
+        def __init__(self):
+            self.uploads = 0
+
+        def open(self, *, interactive=False):
+            return "stable-account"
+
+        def upload(self, path):
+            self.uploads += 1
+
+        def close(self):
+            pass
+
+    configured = settings(tmp_path)
+    configured["google"].update(
+        {"upload_timeout_seconds": timeout, "upload_poll_seconds": poll, "auto_original_quality": False}
+    )
+    client = Client()
+    remote = GooglePhotosRemote(configured, client=client, payloads=Payloads, browser=Browser())
+    return remote, path
+
+
+def test_upload_polls_readiness_after_exact_hash_until_bytes_are_available(tmp_path, monkeypatch):
+    monkeypatch.setattr("photos_shrink.remote.time.sleep", lambda seconds: None)
+    remote, path = _upload_remote(tmp_path)
+    match = {"id": "replacement", "content_hash": "hash"}
+    verified = {"id": "replacement", "size_bytes": path.stat().st_size, "is_original_quality": False}
+    remote.find_uploaded = lambda path: match
+    remote.get_item = lambda id: verified
+    checks = []
+
+    def verify(item, expected_sha):
+        checks.append(remote._upload_in_progress)
+        if len(checks) == 1:
+            raise RemoteProtocolError("original bytes are not ready")
+
+    remote._verify_remote_bytes = verify
+    result = remote.upload(path)
+
+    assert result["id"] == "replacement"
+    assert len(checks) == 2
+    assert all(checks)
+    assert remote._browser.uploads == 1
+
+
+def test_upload_readiness_failure_is_bounded_and_reports_last_reason(tmp_path, monkeypatch):
+    monkeypatch.setattr("photos_shrink.remote.time.sleep", lambda seconds: None)
+    remote, path = _upload_remote(tmp_path, timeout=0.02, poll=0.001)
+    match = {"id": "replacement", "content_hash": "hash"}
+    verified = {"id": "replacement", "size_bytes": path.stat().st_size, "is_original_quality": False}
+    remote.find_uploaded = lambda path: match
+    remote.get_item = lambda id: verified
+    checks = []
+    remote._verify_remote_bytes = lambda item, expected_sha: checks.append(True) or (_ for _ in ()).throw(
+        RemoteProtocolError("original bytes are not ready")
+    )
+
+    with pytest.raises(RemoteProtocolError, match="readiness.*original bytes are not ready"):
+        remote.upload(path)
+
+    assert len(checks) > 1
+    assert remote._browser.uploads == 1
+    assert remote._upload_in_progress is False
+
+
+def test_upload_readiness_does_not_refresh_browser_during_active_upload(tmp_path, monkeypatch):
+    monkeypatch.setattr("photos_shrink.remote.time.sleep", lambda seconds: None)
+    remote, path = _upload_remote(tmp_path)
+    match = {"id": "replacement", "content_hash": "hash"}
+    verified = {"id": "replacement", "size_bytes": path.stat().st_size, "is_original_quality": True}
+    remote.find_uploaded = lambda path: match
+    remote.get_item = lambda id: verified
+    remote._verify_remote_bytes = lambda item, expected_sha: None
+    refreshes = []
+    remote.refresh_session = lambda: refreshes.append(remote._upload_in_progress)
+    remote._last_refresh_monotonic = 0
+    remote._session_refresh_seconds = 0.001
+
+    result = remote.upload(path)
+
+    assert result["id"] == "replacement"
+    assert refreshes == []
 
 
 def test_trusted_upload_with_missing_source_is_safe(tmp_path):

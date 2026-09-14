@@ -22,6 +22,10 @@ browser_profile = ".photos-shrink/browser"
 browser_channel = "chrome"
 browser_headless = true
 account_index = 1
+session_refresh_seconds = 300
+upload_timeout_seconds = 300
+upload_poll_seconds = 5
+auto_original_quality = true
 
 [run]
 work_dir = ".photos-shrink"
@@ -31,6 +35,8 @@ threads = 2
 skip_shared = false
 limit = 0
 skip_non_space_consuming = true
+photos_only = false
+selection_order = "largest"
 
 [exclude]
 timezone = "America/New_York"

@@ -46,6 +46,8 @@ Uploads run in background Chrome by default (`[google].browser_headless = true`)
 | `--keep-originals` | Upload and verify replacements while retaining originals. |
 | No mode option | Ask for approval, then upload, verify, and trash each eligible original. |
 | `--limit 10` | Limit the batch to ten eligible media items, including pending operations. |
+| `--photos-only` | Exclude videos, including pending video replacements. |
+| `--newest-first` | Stream newest candidates and stop once the batch has enough eligible plans. |
 | `--yes` | Apply without the terminal approval prompt. |
 | `--config FILE` | Load another TOML configuration. |
 | `--report FILE.csv` | Choose a protected, atomically written CSV report location. |
@@ -62,6 +64,14 @@ Use `--config path/to/shrink.toml` for another configuration. `--yes` explicitly
 `--report path/to/report.csv` changes the report location. Use a `.csv` filename outside protected authentication, journal, and media paths. Inside the work directory, reports must be directly in its root. The previous CSV is replaced only after the new report is fully written.
 
 `--limit 3` selects at most three items that meet the savings threshold, including pending replacements. The library is scanned in full so exclusions and previous replacements cannot hide later candidates; this can take time on a large library. Candidates are considered largest first. Originals and output files remain on disk, so allow enough local free space for the selected batch.
+
+For a ten-photo pilot without a full-library scan:
+
+```powershell
+uv run --locked photos-shrink --photos-only --newest-first --limit 10 --keep-originals
+```
+
+Newest-first selection continues past exclusions, unsupported files, and insufficient savings until it has enough eligible plans or reaches the end of the library. Existing eligible pending replacements count toward the limit. Planning and the CSV still come before any upload. Configure these choices permanently with `[run].photos_only` and `[run].selection_order` (`"largest"` or `"newest"`).
 
 Use `uv run photos-shrink --limit 1 --keep-originals` for a pilot that uploads and verifies a replacement while retaining its original. The journal remembers the uploaded copy; repeating with `--keep-originals` verifies it again without trashing. A later normal run can finish that pending replacement after verification.
 
@@ -94,6 +104,12 @@ The default work directory, `.photos-shrink/`, holds the private cookie export, 
 
 On a session error, export fresh cookies from normal Chrome and rerun the same command. Cookie expiry dates do not guarantee that Google will continue accepting a session. If the upload outcome is ambiguous, the app stops until it can reconcile the exact content hash; replacing cookies does not bypass that safeguard. Pressing Ctrl+C stops a foreground run, and the next run uses the saved journal to resume.
 
+During active runs, `[google].session_refresh_seconds = 300` enables best-effort refresh between operations. The app reloads its dedicated background Chrome session, checks the account, updates the HTTP cookies, and reloads Google's request tokens. A failed read can trigger one refresh-and-retry. Upload and deletion requests are never automatically replayed, and refresh does not reload the page while an upload may be in progress. Set the interval to `0` to disable automatic refresh. This is not an always-on keepalive service: Google can still require a fresh manual login, and the exported cookie file is preserved.
+
+Google may briefly serve a JPEG while a newly uploaded AVIF is still processing. The app waits for the exact uploaded bytes before accepting the replacement. Configure that wait with `[google].upload_timeout_seconds` (default `300`) and `upload_poll_seconds` (default `5`). If it times out, the journal preserves the upload intent; rerunning reconciles the existing copy by its content hash.
+
+With automatic refresh enabled, startup can recover from an expired cookie export using the app's saved Chrome profile. That recovery preserves the export and verifies the browser and HTTP account identities before proceeding. If both sessions have expired, a new manual cookie export is still required.
+
 Cookies, browser state, local media, generated reports, dependency caches, and test scratch directories are ignored by Git. Share source code and redacted diagnostics, not the work directory.
 
 ## What replacement preserves
@@ -102,7 +118,7 @@ Replacement creates a **new Google Photos item**. Supported capture timestamps, 
 
 For photos, the encoder stamps Google Photos latitude and longitude into the replacement's EXIF GPS fields, including when those coordinates were absent from the downloaded original. After upload, the tool checks that Google reads the same location (within 0.0000001 degrees). Videos retain embedded metadata; a Google-only video location is not currently stamped. Missing or changed coordinates prevent trash. Google-derived place names and location provenance may differ. A failed metadata operation or verification retains the original; the CSV records the failure. The undocumented interface still requires a successful live pilot before broad use.
 
-Google Photos can recompress browser uploads when Storage saver is selected. The tool must verify that the remote copy matches its expectations before trashing an original. If it cannot, it stops that replacement and retains the original. It does not silently change your account-wide backup-quality setting.
+Google Photos can recompress browser uploads when Storage saver is selected. By default, `[google].auto_original_quality = true` selects and verifies Original quality in the website settings before each upload, preserving the files this app has already compressed. It leaves Original quality selected. Set this option to `false` to leave Google's setting alone. This preference does not change encoding settings or retroactively restore previously recompressed uploads. The tool still verifies replacement bytes and metadata before trashing any original.
 
 File savings are not necessarily Google storage savings. Some existing items consume no quota; reuploading them can increase quota usage. Known non-quota items are skipped by default. The CSV labels its savings as file bytes and includes original quota consumption when known; quota savings remain unknown. Estimated file sizes and actual encoded sizes are reported separately.
 

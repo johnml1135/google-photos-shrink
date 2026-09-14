@@ -38,6 +38,16 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--report", help="CSV report path")
     parser.add_argument("--limit", type=int, help="process at most N eligible items")
     parser.add_argument(
+        "--photos-only",
+        action="store_true",
+        help="pilot mode: process photos and skip videos",
+    )
+    parser.add_argument(
+        "--newest-first",
+        action="store_true",
+        help="plan items in the remote newest-first order",
+    )
+    parser.add_argument(
         "--login",
         action="store_true",
         help="explain the required normal-Chrome cookie export",
@@ -94,11 +104,16 @@ def main(argv: list[str] | None = None) -> int:
     args = _parser().parse_args(argv)
     try:
         settings = load_config(args.config)
-        if args.limit is not None:
-            if args.limit < 0:
-                raise ConfigError("--limit must be >= 0")
+        if args.limit is not None or args.photos_only or args.newest_first:
             run = dict(settings.run)
-            run["limit"] = args.limit
+            if args.limit is not None:
+                if args.limit < 0:
+                    raise ConfigError("--limit must be >= 0")
+                run["limit"] = args.limit
+            if args.photos_only:
+                run["photos_only"] = True
+            if args.newest_first:
+                run["selection_order"] = "newest"
             settings = replace(settings, run=run)
         if args.doctor:
             return doctor(settings)
