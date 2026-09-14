@@ -2,7 +2,7 @@
 
 A Python command that inventories Google Photos, writes a CSV for review, and replaces eligible items one at a time with smaller copies. Photos use **1500 pixels on the shorter side**, AVIF quality 60, without upscaling. Videos fit within 1920×1080 (or 1080×1920 for portrait) and use HEVC in MP4.
 
-This uses the unofficial [Google Photos Python web client](https://github.com/xob0t/google_photos_web_client), pinned to a reviewed revision, for library operations. The official Google Photos API cannot read your pre-existing library or replace/delete its files.
+This uses the unofficial [Google Photos Python web client](https://github.com/xob0t/google_photos_web_client), pinned to a reviewed revision, for library operations. The official Google Photos API cannot read your pre-existing library, cannot delete anything, and cannot replace an item's bytes — `mediaItems.patch` accepts only `description`. It *can* upload new items via the `photoslibrary.appendonly` scope. See [Working from a Google Takeout export](#working-from-a-google-takeout-export).
 
 ## Setup
 
@@ -121,6 +121,70 @@ For photos, the encoder stamps Google Photos latitude and longitude into the rep
 Google Photos can recompress browser uploads when Storage saver is selected. By default, `[google].auto_original_quality = true` selects and verifies Original quality in the website settings before each upload, preserving the files this app has already compressed. It leaves Original quality selected. Set this option to `false` to leave Google's setting alone. This preference does not change encoding settings or retroactively restore previously recompressed uploads. The tool still verifies replacement bytes and metadata before trashing any original.
 
 File savings are not necessarily Google storage savings. Some existing items consume no quota; reuploading them can increase quota usage. Known non-quota items are skipped by default. The CSV labels its savings as file bytes and includes original quota consumption when known; quota savings remain unknown. Estimated file sizes and actual encoded sizes are reported separately.
+
+## Working from a Google Takeout export
+
+Replacing items one at a time through a single browser session makes every batch
+depend on that session surviving download, encoding, upload, and verification for
+each item. A [Google Takeout](https://takeout.google.com/) export removes the two
+longest phases from that dependency: the bulk download happens once through a
+supported channel, and encoding then runs entirely offline.
+
+`photos_shrink.takeout` reads an extracted export. Google separates each file
+from its metadata and the sidecar naming is lossy — `.supplemental-metadata.json`
+is truncated to an arbitrary prefix (`.supple.json`, sometimes `.s.json`),
+duplicate counters migrate across the extension (`IMG_0001(1).jpg` pairs with
+`IMG_0001.jpg(1).json`), and `-edited` suffixes are clipped to `-edi` or shorter.
+Every de-truncation is self-validating: a candidate is accepted only when it
+resolves to a sidecar that exists, and an ambiguous prefix resolves to nothing.
+A wrong guess yields "no sidecar" rather than another item's timestamps.
+
+**Files with no resolvable timestamp must be quarantined, not uploaded.** Without
+one, Google dates the upload to the day it arrives and the timeline is scrambled.
+
+### Verified API behaviour
+
+Confirmed against Google's documentation on 2026-09-14:
+
+| Question | Answer |
+| --- | --- |
+| Update an existing item's bytes? | No. `mediaItems.patch` accepts only `description` in `updateMask`. |
+| Delete library items? | No. The API has no delete method. |
+| Upload new items? | Yes, via `photoslibrary.appendonly`: raw bytes to `/v1/uploads` for a token, then `mediaItems.batchCreate`. |
+| Read the existing library? | No. Only items the app itself created. |
+| Is AVIF accepted? | Yes: `AVIF, BMP, GIF, HEIC, ICO, JPG, PNG, TIFF, WEBP, some RAW`. |
+| Does upload honour Storage saver? | No — uploads are "stored in full resolution at original quality". |
+
+Limits: photos 200 MB, videos 20 GB, upload tokens valid 24 hours.
+
+There is therefore no in-place update by any route. Replacing an item is always
+upload-new followed by delete-old, and deletion stays on the browser adapter.
+
+### Checking an export
+
+Takeout files are joined to library items by SHA-256 of their bytes. That join is
+unproven until measured against your own export, so check it before trusting it:
+
+```powershell
+uv run python tools/takeout_probe.py "D:/path/to/Takeout" --sample 25
+```
+
+The probe reports export inventory (file counts, size by kind, sidecar coverage,
+albums) and then hash-matches a stratified sample against your library. It
+uploads nothing, trashes nothing, and modifies nothing. Add `--offline` to skip
+Google entirely and see the inventory alone.
+
+A high match rate means the hash join is sound and deletion can be targeted
+precisely. A low rate means Takeout is rewriting bytes, and a weaker join such as
+filename and timestamp is not sufficient grounds to delete anything.
+
+### What this route still cannot preserve
+
+Because replacement always creates a new item, face and people groupings, shared
+album comments and likes, and existing item links are lost — no export or API
+restores them. Album membership is recoverable from the export's folder structure.
+Weigh this against Google's built-in **Recover storage**, which is lossless to all
+of that but only compresses to 16 MP for photos and 1080p for video.
 
 ## Development
 
