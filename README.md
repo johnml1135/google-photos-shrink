@@ -178,22 +178,47 @@ A high match rate means the hash join is sound and deletion can be targeted
 precisely. A low rate means Takeout is rewriting bytes, and a weaker join such as
 filename and timestamp is not sufficient grounds to delete anything.
 
-### Encoding a bounded batch offline
+### Taking stock of the export
 
 ```powershell
-uv run python tools/takeout_pilot.py "D:/path/to/Takeout" --limit 10
+uv run python tools/takeout_mirror.py "D:/path/to/Takeout"
 ```
 
-Selects the largest eligible items, encodes and verifies each one, and writes a
-CSV of real old/new sizes and dimensions. Items without a resolvable timestamp
-are never selected. Like the probe this is entirely offline — it contacts
-nothing, uploads nothing, and deletes nothing — so it is safe to run against a
-partially copied export while the rest is still downloading. Pass `--videos` to
-encode videos instead of photos, and `--work` to place outputs off the system
-drive.
+Writes one row per **library item** to `mirror.csv` — media key, capture time,
+albums, location, size and path — plus a summary of what can be replaced safely
+and what cannot.
 
-Multi-frame JPEGs (MPO, and motion photos) are refused rather than flattened to
-a single frame; Google's own Storage saver leaves MPF JPEGs uncompressed too.
+One row per item, not per file: Takeout exports a photo once for every album it
+belongs to *and* again under its date bucket, so counting files overstates a
+library. Everything downstream selects from this mirror, which is what stops the
+same photo being encoded and uploaded several times.
+
+### Encoding
+
+```powershell
+uv run python tools/takeout_encode.py "D:/path/to/Takeout"            # everything
+uv run python tools/takeout_encode.py "D:/path/to/Takeout" --limit 500 # a batch
+uv run python tools/takeout_encode.py "D:/path/to/Takeout" --kinds video
+```
+
+Encodes largest first, verifies each output, and writes `encoded.csv` for the
+uploader. Entirely offline — it contacts nothing, uploads nothing, deletes
+nothing — so it is safe to run against a partially copied export while the rest
+is still downloading.
+
+**A full run is resumable.** Output names are deterministic, so an item already
+encoded is reused instead of re-encoded, and the CSV is flushed as it goes.
+Re-running after an interruption, a crash, or a reboot is always safe and skips
+the work already done. Photos are encoded before videos, so most of the savings
+land early even if a long video pass is cut short.
+
+Items are refused rather than silently mangled when they have no capture time
+(they would be dated "today" on upload), no media key (the original could never
+be identified again), or more than one frame — MPO files and motion photos.
+Google's own Storage saver leaves MPF JPEGs uncompressed too.
+
+Use `--work` to keep outputs off the system drive; a large library's encodes
+still run to gigabytes even at ~90% savings.
 
 ### Uploading over the official API
 
@@ -253,6 +278,61 @@ app still works, behind a warning screen you accept once.
 
 Uploads through this path are stored at original quality and are not subject to
 the Storage saver transcoding that affects browser uploads.
+
+### Replacing the originals
+
+```powershell
+uv run python tools/takeout_replace.py --journal G:/takeout-work/journal.json   # dry run
+uv run python tools/takeout_replace.py --journal G:/takeout-work/journal.json --apply
+```
+
+Restores the original's capture time, description, favourite and archive state,
+location and album membership onto the replacement, verifies it, and only then
+moves the original to Google Photos trash. This is the sequence the main
+pipeline uses, in the same order, and it is the closest thing to replacement
+that exists — no API or web client can swap an item's bytes in place.
+
+This step needs the browser session, because the API can neither write album
+membership nor delete. It is nonetheless short: the mirror already supplies each
+media key, so no library scan is needed — just a few small requests per photo
+with no file transfer. That is what keeps the phase inside one session.
+
+**Dry run is the default.** `--apply` is required before anything changes, and
+`--keep-originals` restores and verifies without ever trashing. Nothing is
+trashed whose replacement was not found by content hash and matched against the
+original's identity. Every original also remains in the Takeout export on disk,
+so a mistake is recoverable by re-uploading.
+
+### The whole sequence
+
+Once set up, a library run is five commands:
+
+```powershell
+# 1. Inventory the export (offline)
+uv run python tools/takeout_mirror.py "D:/path/to/Takeout"
+
+# 2. Encode it (offline, resumable, hours for a large library)
+uv run python tools/takeout_encode.py "D:/path/to/Takeout"
+
+# 3. Upload the replacements (OAuth; no cookies)
+uv run python tools/takeout_upload.py --report G:/takeout-work/encoded.csv `
+    --journal G:/takeout-work/journal.json --album "photos-shrink batch 1"
+
+# 4. See what replacement would do (changes nothing)
+uv run python tools/takeout_replace.py --journal G:/takeout-work/journal.json
+
+# 5. Replace: restore metadata, verify, trash the originals (browser session)
+uv run python tools/takeout_replace.py --journal G:/takeout-work/journal.json --apply
+```
+
+Steps 2 and 3 are resumable and safe to re-run; both track work by the library's
+own media key, so an interrupted run never uploads a photo twice. Step 5 is the
+only one that removes anything, and only after each replacement has been
+verified individually.
+
+Work in batches rather than all at once. Uploading an entire library before
+deleting anything temporarily *increases* storage, since both copies exist until
+step 5 runs.
 
 ### What this route still cannot preserve
 

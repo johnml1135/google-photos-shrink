@@ -1,6 +1,6 @@
 """Upload encoded Takeout replacements through the official Photos API.
 
-Reads the CSV written by tools/takeout_pilot.py, uploads each encoded file,
+Reads the CSV written by tools/takeout_encode.py, uploads each encoded file,
 verifies the created item by reading it back, and records the result so a later
 pass can delete the corresponding originals.
 
@@ -60,7 +60,7 @@ def verify_item(item: dict, source: Path, settings: dict) -> tuple[str, str]:
 
 def main() -> int:
     parser = argparse.ArgumentParser(description="Upload encoded replacements via the Photos API")
-    parser.add_argument("--report", type=Path, default=Path("G:/takeout-work/takeout-pilot.csv"))
+    parser.add_argument("--report", type=Path, default=Path("G:/takeout-work/encoded.csv"))
     parser.add_argument("--config", default="shrink.toml")
     parser.add_argument("--limit", type=int, default=0, help="0 uploads every encoded row")
     parser.add_argument("--album", default=None, help="Create/use an album for the replacements")
@@ -75,7 +75,7 @@ def main() -> int:
     args = parser.parse_args()
 
     if not args.report.exists():
-        print(f"No encode report at {args.report}. Run tools/takeout_pilot.py first.", file=sys.stderr)
+        print(f"No encode report at {args.report}. Run tools/takeout_encode.py first.", file=sys.stderr)
         return 2
 
     rows = [r for r in csv.DictReader(open(args.report, encoding="utf-8")) if r["status"] == "encoded"]
