@@ -17,7 +17,7 @@ def test_state_persists_upload_intent_and_resume_boundaries(tmp_path: Path):
     row = resumed.get_item("orig")
     assert row["stage"] == "trash_ready"
     assert row["replacement_id"] == "replacement"
-    assert resumed.is_replaced("orig", "out-hash")
+    assert row["output_hash"] == "out-hash"
     resumed.mark_trashed("orig")
     assert resumed.get_item("orig")["stage"] == "trashed"
     resumed.close()

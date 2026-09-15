@@ -26,7 +26,7 @@ name_globs = ["*.JPG"]
     assert cfg.run["work_dir"] == str(tmp_path / "state")
     assert cfg.tools["ffmpeg"] == "ffmpeg"
     assert cfg.exclude["date_ranges"][0]["start"] == date(2024, 1, 1)
-    assert cfg.matches_exclusion("IMG_1.jpg", 1704153600000)
+    assert cfg.exclusion_reason({"filename": "IMG_1.jpg", "timestamp_ms": 1704153600000})
     assert cfg.fingerprint == load_config(config_path).fingerprint
 
 

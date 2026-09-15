@@ -14,6 +14,7 @@ from photos_shrink.auth import (
     UploadNotStartedError,
     load_netscape_cookies,
 )
+from photos_shrink.integrity import sha256_file
 from photos_shrink.remote import (
     GooglePhotosRemote,
     RemoteProtocolError,
@@ -599,22 +600,6 @@ def test_upload_quality_preflight_failure_prevents_file_submission(tmp_path):
     assert calls == ["stable-account"]
 
 
-def test_explicit_ensure_upload_quality_uses_current_browser_account(tmp_path):
-    calls = []
-
-    class Browser:
-        def open(self, *, interactive=False):
-            calls.append(("open", interactive))
-            return "stable-account"
-
-        def ensure_original_quality(self, expected_account):
-            calls.append(("quality", expected_account))
-
-    remote = GooglePhotosRemote(settings(tmp_path), client=Client(), payloads=Payloads, browser=Browser())
-    remote.ensure_upload_quality()
-    assert calls == [("open", False), ("quality", "stable-account")]
-
-
 @pytest.mark.parametrize("failure", ["construct", "account", "open"])
 def test_upload_pre_submission_failures_are_retryable(tmp_path, monkeypatch, failure):
     path = tmp_path / "encoded.jpg"
@@ -870,7 +855,7 @@ def test_upstream_parser_shaped_item_normalizes_timestamp_albums_and_video_units
 def test_replacement_verification_requires_hash_and_accepts_album_order_and_duration_tolerance(tmp_path):
     output = tmp_path / "encoded.jpg"
     output.write_bytes(b"encoded")
-    sha256 = GooglePhotosRemote._sha256(output)
+    sha256 = sha256_file(output)
     metadata = {
         "description": "caption",
         "favorite": True,
@@ -930,7 +915,7 @@ def test_replacement_verification_requires_hash_and_accepts_album_order_and_dura
 def test_photo_replacement_verification_does_not_require_video_duration(tmp_path):
     output = tmp_path / "encoded.jpg"
     output.write_bytes(b"encoded")
-    sha256 = GooglePhotosRemote._sha256(output)
+    sha256 = sha256_file(output)
     metadata = {
         "description": "caption",
         "favorite": False,
@@ -980,7 +965,7 @@ def test_photo_replacement_verification_does_not_require_video_duration(tmp_path
 def test_remote_byte_verification_rejects_changed_download(tmp_path):
     output = tmp_path / "encoded.jpg"
     output.write_bytes(b"encoded")
-    expected_sha256 = GooglePhotosRemote._sha256(output)
+    expected_sha256 = sha256_file(output)
     client = Client(Response(content=b"changed", headers={"content-type": "image/jpeg"}))
     remote = GooglePhotosRemote(settings(tmp_path), client=client, payloads=Payloads)
 

@@ -75,9 +75,6 @@ class Settings:
     def __getitem__(self, key: str) -> dict[str, Any]:
         return getattr(self, key)
 
-    def matches_exclusion(self, filename: str, timestamp_ms: int | None) -> bool:
-        return self.exclusion_reason({"filename": filename, "timestamp_ms": timestamp_ms}) is not None
-
     def exclusion_reason(self, item: dict[str, Any]) -> str | None:
         filename = str(item.get("filename") or "")
         globs = self.exclude["name_globs"]
@@ -201,51 +198,3 @@ def _jsonable(value: Any) -> Any:
     if isinstance(value, list):
         return [_jsonable(v) for v in value]
     return value
-
-
-def default_config_text() -> str:
-    return """[photos]
-short_edge = 1500
-format = "avif"
-quality = 60
-
-[videos]
-long_edge = 1920
-short_edge = 1080
-codec = "hevc"
-crf = 28
-preset = "slow"
-max_fps = 0
-audio_bitrate_kbps = 96
-
-[tools]
-ffmpeg = "ffmpeg"
-ffprobe = "ffprobe"
-
-[google]
-cookies_file = ".photos-shrink/cookies.txt"
-browser_profile = ".photos-shrink/browser"
-browser_channel = "chrome"
-browser_headless = true
-account_index = 0
-session_refresh_seconds = 300
-upload_timeout_seconds = 300
-upload_poll_seconds = 5
-auto_original_quality = true
-
-[run]
-work_dir = ".photos-shrink"
-pause_seconds = 10
-minimum_savings_percent = 20
-threads = 2
-skip_shared = true
-limit = 0
-skip_non_space_consuming = true
-photos_only = false
-selection_order = "largest"
-
-[exclude]
-timezone = "America/New_York"
-date_ranges = []
-name_globs = []
-"""

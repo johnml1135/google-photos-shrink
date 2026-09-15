@@ -609,18 +609,18 @@ class GooglePhotosRemote:
         original_url = getattr(info, "download_original_url", None)
         if not isinstance(original_url, str) or not urlparse(original_url).scheme:
             skip_reason = skip_reason or "original download URL is unavailable"
+        # Quota, from whichever of the two payloads reports it. The gate reads
+        # both the byte count and the flag, so they must agree by construction.
+        space_taken = self._first_not_none(
+            getattr(ext, "space_taken", None), getattr(info, "space_taken", None)
+        )
         return {
             "id": media_key,
             "dedup_key": dedup_key,
             "filename": filename,
             "size_bytes": size,
-            "space_taken_bytes": self._first_not_none(getattr(ext, "space_taken", None), getattr(info, "space_taken", None)),
-            "space_consuming_bytes": self._first_not_none(getattr(ext, "space_taken", None), getattr(info, "space_taken", None)),
-            "space_consuming": (
-                None
-                if (space_taken := self._first_not_none(getattr(ext, "space_taken", None), getattr(info, "space_taken", None))) is None
-                else space_taken > 0
-            ),
+            "space_taken_bytes": space_taken,
+            "space_consuming": None if space_taken is None else space_taken > 0,
             "width": width,
             "height": height,
             "kind": kind,
@@ -769,44 +769,16 @@ class GooglePhotosRemote:
             }
         return None
 
-    @staticmethod
-    def _sha256(path: Path) -> str:
-        return sha256_file(path)
-
     def _verify_remote_bytes(self, item: dict[str, Any], expected_sha256: str) -> None:
         if not isinstance(item.get("original_url"), str):
             raise RemoteProtocolError("uploaded item has no original URL for byte verification")
         with tempfile.TemporaryDirectory(prefix="photos-shrink-verify-") as work:
             probe = Path(work) / "remote-original"
             self.download(item, probe)
-            if self._sha256(probe) != expected_sha256:
+            if sha256_file(probe) != expected_sha256:
                 raise RemoteProtocolError(
                     "Google Photos changed uploaded bytes; select Original quality and retry"
                 )
-
-    def ensure_upload_quality(self) -> None:
-        """Explicitly select Original quality in the active browser account."""
-
-        if self._browser is None:
-            try:
-                self._browser = BrowserAuthenticator(self.settings)
-            except Exception as exc:  # noqa: BLE001 - browser setup varies by environment
-                raise RemoteProtocolError("browser upload setup failed") from exc
-        try:
-            client_identity = self.account_id()
-            browser_identity = self._browser.open(interactive=False)
-            if browser_identity != client_identity:
-                raise RemoteProtocolError(
-                    "browser and gpwc sessions are authenticated to different accounts"
-                )
-            ensure = getattr(self._browser, "ensure_original_quality", None)
-            if not callable(ensure):
-                raise RemoteProtocolError("Original quality control is unavailable")
-            ensure(client_identity)
-        except RemoteProtocolError:
-            raise
-        except Exception as exc:  # noqa: BLE001 - browser/UI failures vary
-            raise RemoteProtocolError("Original quality could not be enabled") from exc
 
     def upload(self, path: str | os.PathLike[str]) -> dict[str, Any]:
         file_path = Path(path)
@@ -856,7 +828,7 @@ class GooglePhotosRemote:
             poll_seconds = float(self.google.get("upload_poll_seconds", 1))
             readiness_poll_seconds = max(poll_seconds, 3.0)
             deadline = time.monotonic() + timeout
-            expected_sha = self._sha256(file_path)
+            expected_sha = sha256_file(file_path)
             match = None
             last_readiness_error: RemoteProtocolError | None = None
             while time.monotonic() < deadline:
@@ -1023,7 +995,7 @@ class GooglePhotosRemote:
         if replacement.get("sha256") and replacement["sha256"] != expected_sha:
             raise RemoteProtocolError("replacement content hash does not match encoded output")
         local_path = Path(output_path)
-        if not local_path.is_file() or self._sha256(local_path) != expected_sha:
+        if not local_path.is_file() or sha256_file(local_path) != expected_sha:
             raise RemoteProtocolError("local encoded output hash changed")
         self._verify_remote_bytes(fresh, expected_sha)
 

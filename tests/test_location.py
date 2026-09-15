@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import pytest
 
+from photos_shrink.integrity import sha256_file
 from photos_shrink.remote import GooglePhotosRemote, RemoteProtocolError
 
 
@@ -126,7 +127,7 @@ def test_verify_replacement_checks_location_presence_and_value(tmp_path):
 
     output = tmp_path / "encoded.jpg"
     output.write_bytes(b"x")
-    digest = GooglePhotosRemote._sha256(output)
+    digest = sha256_file(output)
 
     class Remote(GooglePhotosRemote):
         def get_item(self, item_id):
@@ -147,7 +148,7 @@ def test_verify_replacement_checks_location_presence_and_value(tmp_path):
 def test_location_roundtrip_tolerates_exif_float_rounding(tmp_path):
     output = tmp_path / "encoded.jpg"
     output.write_bytes(b"x")
-    digest = GooglePhotosRemote._sha256(output)
+    digest = sha256_file(output)
     md = {**metadata(), "description": None, "favorite": False, "archived": False, "albums": []}
     original = {"id": "old", "dedup_key": "old-key", "timestamp_ms": 1, "timezone_offset": 0, "metadata": md}
     replacement = {"id": "new", "dedup_key": "new-key", "size_bytes": 1, "width": 1, "height": 1, "kind": "photo", "sha256": digest}

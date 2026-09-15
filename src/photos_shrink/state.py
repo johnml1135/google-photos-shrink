@@ -135,12 +135,6 @@ class StateStore:
         row = self.db.execute("SELECT * FROM items WHERE original_id=?", (original_id,)).fetchone()
         return dict(row) if row else None
 
-    def is_replaced(self, original_id: str, output_hash: str | None = None) -> bool:
-        row = self.get_item(original_id)
-        if not row or row["stage"] not in {"uploaded", "trash_ready", "trashed"}:
-            return False
-        return output_hash is None or row["output_hash"] == output_hash
-
     def rows(self) -> list[dict[str, Any]]:
         return [dict(row) for row in self.db.execute("SELECT * FROM items ORDER BY original_id")]
 

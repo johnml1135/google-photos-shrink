@@ -7,6 +7,7 @@ import json
 import pytest
 
 from photos_shrink import takeout
+from photos_shrink.integrity import sha256_file
 
 
 def write(path, payload):
@@ -144,7 +145,7 @@ class TestScan:
         assert record.kind == "photo"
         assert record.album == "Holiday 2024"
         assert record.taken_timestamp_ms == 1600000000 * 1000
-        assert record.sha256 == takeout.sha256(album / "IMG_0001.jpg")
+        assert record.sha256 == sha256_file(album / "IMG_0001.jpg")
         assert record.has_metadata
 
     def test_date_buckets_are_not_albums(self, tmp_path):

@@ -218,12 +218,6 @@ def parse_sidecar(path: str | Path) -> dict[str, Any]:
     }
 
 
-def sha256(path: str | Path) -> str:
-    """Hash a file through the repo's single hashing seam."""
-
-    return sha256_file(Path(path))
-
-
 def _album_name(directory: Path, root: Path) -> str | None:
     """Return the album a directory represents, or None for a date bucket."""
 
@@ -288,7 +282,7 @@ def scan(root: str | Path, *, compute_hash: bool = False) -> Iterator[TakeoutRec
                 size_bytes=path.stat().st_size,
                 edited=edited,
                 album=album,
-                sha256=sha256(path) if compute_hash else None,
+                sha256=sha256_file(path) if compute_hash else None,
                 **fields,
             )
 
