@@ -641,3 +641,37 @@ def test_csv_report_neutralizes_formula_after_leading_whitespace(tmp_path: Path)
     assert row["new_path"] == ""
     assert row["reason"] == "unsafe test item"
     assert Pipeline._csv_value("") == ""
+
+
+def test_item_media_is_kept_out_of_the_work_directory_root(tmp_path: Path):
+    """The work root holds the cookie export and API token a human must replace.
+
+    Per-item directories are hash-named and numerous -- 102 of them buried those
+    credentials in practice -- so they belong in a subdirectory.
+    """
+
+    config = tmp_path / "shrink.toml"
+    config.write_text("[run]\nwork_dir = 'work'\npause_seconds = 0\n", encoding="utf-8")
+    cfg = load_config(config)
+    state = StateStore(tmp_path / "state.sqlite", "account", cfg.fingerprint)
+    pipeline = Pipeline(cfg, FakeRemote(tmp_path), state, media=FakeMedia())
+
+    directory = pipeline._item_dir("some-remote-id")
+
+    assert directory.parent.name == "items"
+    assert directory.parent.parent == pipeline.work_dir
+    assert directory.is_dir()
+    # Nothing hash-named sits beside the credentials.
+    assert [p.name for p in pipeline.work_dir.iterdir() if p.is_dir()] == ["items"]
+    state.close()
+
+
+def test_item_directories_are_distinct_per_item(tmp_path: Path):
+    config = tmp_path / "shrink.toml"
+    config.write_text("[run]\nwork_dir = 'work'\npause_seconds = 0\n", encoding="utf-8")
+    cfg = load_config(config)
+    state = StateStore(tmp_path / "state.sqlite", "account", cfg.fingerprint)
+    pipeline = Pipeline(cfg, FakeRemote(tmp_path), state, media=FakeMedia())
+    assert pipeline._item_dir("a") != pipeline._item_dir("b")
+    assert pipeline._item_dir("a") == pipeline._item_dir("a")
+    state.close()

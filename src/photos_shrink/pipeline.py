@@ -51,9 +51,18 @@ class Pipeline:
         if callable(register_replacements):
             register_replacements(self._output_ids)
 
+    ITEMS_SUBDIR = "items"
+
     def _item_dir(self, item_id: str) -> Path:
-        # IDs are untrusted: a digest gives a stable path below work_dir.
-        directory = self.work_dir / hashlib.sha256(str(item_id).encode()).hexdigest()[:24]
+        # IDs are untrusted: a digest gives a stable path below work_dir. These
+        # live under items/ so the work directory's root stays readable -- it
+        # also holds the cookie export and API token, which the operator has to
+        # find and replace by hand.
+        directory = (
+            self.work_dir
+            / self.ITEMS_SUBDIR
+            / hashlib.sha256(str(item_id).encode()).hexdigest()[:24]
+        )
         directory.mkdir(parents=True, exist_ok=True)
         return directory
 

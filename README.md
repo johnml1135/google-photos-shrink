@@ -100,7 +100,7 @@ The working configuration requires at least 20% file savings, pauses 10 seconds 
 
 ## Files and recovery
 
-The default work directory, `.photos-shrink/`, holds the private cookie export, upload browser profile, original backups, encoded outputs, SQLite journal, and `photos-shrink.csv`. Keep it between runs: the journal identifies replacements by remote identity and content hash, and the backups support recovery. The process lock prevents two runs from changing the same journal concurrently.
+The default work directory, `.photos-shrink/`, holds the private cookie export, the API token and client credentials, the upload browser profile, the SQLite journal, and `photos-shrink.csv`. Per-item originals and encoded outputs live one level down in `items/`, so the things a human has to find and replace by hand stay visible in the root rather than buried among hash-named directories. Keep the directory between runs: the journal identifies replacements by remote identity and content hash, and the backups support recovery. The process lock prevents two runs from changing the same journal concurrently.
 
 On a session error, export fresh cookies from normal Chrome and rerun the same command. Cookie expiry dates do not guarantee that Google will continue accepting a session. If the upload outcome is ambiguous, the app stops until it can reconcile the exact content hash; replacing cookies does not bypass that safeguard. Pressing Ctrl+C stops a foreground run, and the next run uses the saved journal to resume.
 

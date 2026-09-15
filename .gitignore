@@ -1,5 +1,6 @@
 .venv/
 .cache/
+.cache-*/
 .worktrees/
 .photos-shrink/
 cookies*.txt

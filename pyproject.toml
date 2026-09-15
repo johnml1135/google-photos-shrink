@@ -28,6 +28,10 @@ where = ["src"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+# Keep scratch and cache under .cache/ rather than scattering dot-directories
+# through the repo root. Pass --basetemp only if you intend that.
+cache_dir = ".cache/pytest"
+tmp_path_retention_policy = "failed"
 
 [tool.ruff.lint]
 select = ["E4", "E7", "E9", "F", "I"]
