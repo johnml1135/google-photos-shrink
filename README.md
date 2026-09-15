@@ -195,6 +195,51 @@ drive.
 Multi-frame JPEGs (MPO, and motion photos) are refused rather than flattened to
 a single frame; Google's own Storage saver leaves MPF JPEGs uncompressed too.
 
+### Uploading over the official API
+
+Exported cookies expire quickly and without warning, which makes them a poor
+foundation for long runs. The official API authenticates with a stored OAuth
+refresh token instead, so it survives across runs. Everything the API is
+permitted to do therefore needs no cookies at all:
+
+| Step | Authentication |
+| --- | --- |
+| Download originals | Google Takeout — no credentials in this app at all |
+| Encode | none; entirely local |
+| Upload replacements | **OAuth** (`photoslibrary.appendonly`) |
+| Verify the uploaded item | **OAuth** (`photoslibrary.readonly.appcreateddata`) |
+| Group replacements into an album | **OAuth** (albums the app creates) |
+| **Delete the originals** | **Exported cookies.** The API has no delete method. |
+
+Deletion is the only step that still requires a browser session, and it is the
+cheapest one: no downloads, no encoding, no uploads, so a batch of deletions
+finishes in a short burst rather than a run lasting hours.
+
+#### One-time setup
+
+In the [Google Cloud Console](https://console.cloud.google.com/): create a
+project, enable the **Photos Library API**, configure the OAuth consent screen,
+and create an OAuth client of type **Desktop app**. Then:
+
+```powershell
+$env:PHOTOS_API_CLIENT_ID     = "....apps.googleusercontent.com"
+$env:PHOTOS_API_CLIENT_SECRET = "...."
+uv run python tools/api_setup.py
+```
+
+That opens Google's consent page once and stores a refresh token at
+`.photos-shrink/api-token.json`. Keep it private — it grants upload access to
+your account, and like the cookie file it is ignored by Git. Verify it later
+with `uv run python tools/api_setup.py --check`.
+
+**Publish the consent screen to "In production."** While it is left in
+"Testing", Google expires refresh tokens after seven days and the client will
+report `invalid_grant`. Publishing removes that limit; an unverified personal
+app still works, behind a warning screen you accept once.
+
+Uploads through this path are stored at original quality and are not subject to
+the Storage saver transcoding that affects browser uploads.
+
 ### What this route still cannot preserve
 
 Because replacement always creates a new item, face and people groupings, shared
