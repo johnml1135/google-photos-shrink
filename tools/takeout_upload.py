@@ -18,9 +18,7 @@ import sys
 import time
 from pathlib import Path
 
-import requests
-
-from photos_shrink import takeout
+from photos_shrink import media, takeout
 from photos_shrink.config import load_config
 from photos_shrink.photos_api import (
     PhotosApiClient,
@@ -29,26 +27,35 @@ from photos_shrink.photos_api import (
 )
 
 
-def verify_bytes(item: dict, expected_sha256: str, timeout: float = 60.0) -> str:
-    """Compare the stored bytes with what was uploaded.
+def verify_item(item: dict, source: Path, settings: dict) -> tuple[str, str]:
+    """Check the created item against the file that was uploaded.
 
-    Returns "match", "differs", or a reason the check could not be made. A
-    failure to check is reported honestly rather than counted as success.
+    Byte comparison is impossible through this API: Google re-renders AVIF (and
+    other formats) to JPEG for delivery, so `baseUrl=d` returns a rendition
+    roughly twice the size of the stored file rather than the stored bytes.
+    Hashing that download reports a mismatch for every single item and tells you
+    nothing, so it is not attempted.
+
+    What the API does report faithfully -- filename, pixel dimensions and
+    capture time -- is checked instead. Returns (verdict, detail).
     """
 
-    base_url = item.get("baseUrl")
-    if not base_url:
-        return "unavailable: no baseUrl returned"
+    metadata = item.get("mediaMetadata") or {}
     try:
-        # "=d" asks for the original bytes rather than a display rendition.
-        response = requests.get(f"{base_url}=d", timeout=timeout)
-        response.raise_for_status()
-    except requests.RequestException as exc:
-        return f"unavailable: {type(exc).__name__}"
+        width, height = int(metadata.get("width")), int(metadata.get("height"))
+    except (TypeError, ValueError):
+        return "unverified", "the API returned no dimensions"
 
-    import hashlib
-
-    return "match" if hashlib.sha256(response.content).hexdigest() == expected_sha256 else "differs"
+    local = media.probe(source, settings.get("tools", {}).get("ffprobe", "ffprobe"))
+    if (width, height) != (local["width"], local["height"]):
+        return "mismatch", (
+            f"stored {width}x{height} but uploaded {local['width']}x{local['height']}"
+        )
+    if item.get("filename") != source.name:
+        return "mismatch", f"stored filename {item.get('filename')!r}"
+    if not metadata.get("creationTime"):
+        return "unverified", "no capture time was recorded"
+    return "ok", str(metadata.get("creationTime"))
 
 
 def main() -> int:
@@ -60,6 +67,11 @@ def main() -> int:
     parser.add_argument("--journal", type=Path, default=None)
     parser.add_argument("--pause", type=float, default=1.0, help="Seconds between uploads")
     parser.add_argument("--dry-run", action="store_true", help="List what would upload, then stop")
+    parser.add_argument(
+        "--reverify",
+        action="store_true",
+        help="Re-check already uploaded items against the API. Uploads nothing.",
+    )
     args = parser.parse_args()
 
     if not args.report.exists():
@@ -85,7 +97,7 @@ def main() -> int:
         for row in pending:
             print(f"  would upload {Path(row['output']).name}", flush=True)
         return 0
-    if not pending:
+    if not pending and not args.reverify:
         print("Nothing to do.", flush=True)
         return 0
 
@@ -104,6 +116,22 @@ def main() -> int:
         print(f"Credentials are not usable: {exc}", file=sys.stderr)
         return 2
     print("API credentials verified.", flush=True)
+
+    if args.reverify:
+        for key, entry in journal.items():
+            try:
+                stored = api.get_media_item(entry["media_item_id"])
+            except PhotosApiError as exc:
+                entry["verified"], entry["verified_detail"] = "unverified", str(exc)
+                continue
+            verdict, detail = verify_item(stored, Path(entry["output"]), settings.as_dict())
+            entry["verified"], entry["verified_detail"] = verdict, detail
+            entry["capture_time"] = (stored.get("mediaMetadata") or {}).get("creationTime")
+            print(f"  {Path(entry['output']).name}: {verdict}  {detail}", flush=True)
+        journal_path.write_text(json.dumps(journal, indent=2), encoding="utf-8")
+        ok = sum(1 for e in journal.values() if e.get("verified") == "ok")
+        print(f"\n  verified {ok}/{len(journal)}; nothing was uploaded.", flush=True)
+        return 0
 
     album_id = None
     if args.album:
@@ -134,7 +162,7 @@ def main() -> int:
             stored = {}
             print(f"      read-back failed: {exc}", flush=True)
 
-        verdict = verify_bytes(stored or item, local_sha)
+        verdict, detail = verify_item(stored or item, output, settings.as_dict())
         journal[str(output)] = {
             "source": row["source"],
             "output": str(output),
@@ -142,28 +170,34 @@ def main() -> int:
             "media_item_id": item["id"],
             "filename": (stored or item).get("filename"),
             "mime_type": (stored or item).get("mimeType"),
-            "bytes_verified": verdict,
+            "verified": verdict,
+            "verified_detail": detail,
+            "capture_time": ((stored or item).get("mediaMetadata") or {}).get("creationTime"),
             "uploaded_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
         }
         journal_path.write_text(json.dumps(journal, indent=2), encoding="utf-8")
 
         uploaded += 1
         print(
-            f"  [{index}/{len(pending)}] {output.name}: uploaded id={item['id'][:18]}... "
-            f"bytes={verdict}",
+            f"  [{index}/{len(pending)}] {output.name}: uploaded  {verdict}  {detail}",
             flush=True,
         )
         if args.pause:
             time.sleep(args.pause)
 
     print(f"\n--- uploaded {uploaded}, failed {failed} ---", flush=True)
-    matched = sum(1 for e in journal.values() if e["bytes_verified"] == "match")
-    differs = [e for e in journal.values() if e["bytes_verified"] == "differs"]
-    print(f"  byte-verified: {matched}/{len(journal)}", flush=True)
-    if differs:
-        print(f"  WARNING: {len(differs)} item(s) differ from what was uploaded:", flush=True)
-        for entry in differs:
-            print(f"    {entry['filename']}", flush=True)
+    ok = sum(1 for e in journal.values() if e.get("verified") == "ok")
+    bad = [e for e in journal.values() if e.get("verified") == "mismatch"]
+    unverified = [e for e in journal.values() if e.get("verified") == "unverified"]
+    print(f"  verified (name, dimensions, capture time): {ok}/{len(journal)}", flush=True)
+    note = "  Note: the API cannot confirm stored bytes; it re-renders AVIF to JPEG on download."
+    print(note, flush=True)
+    if unverified:
+        print(f"  {len(unverified)} item(s) could not be checked.", flush=True)
+    if bad:
+        print(f"  WARNING: {len(bad)} item(s) do not match what was uploaded:", flush=True)
+        for entry in bad:
+            print(f"    {entry['filename']}: {entry['verified_detail']}", flush=True)
         print("  Do NOT delete the originals for those.", flush=True)
     print(f"  journal: {journal_path}", flush=True)
     print("  No originals were deleted.", flush=True)
