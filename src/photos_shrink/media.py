@@ -102,6 +102,11 @@ def _image_probe(path: Path) -> dict[str, Any] | None:
         try:
             exif = image.getexif()
             orientation = exif.get(274, 1)
+            # 0 is outside the 1-8 the spec allows, but cameras write it to mean
+            # "not specified" and every viewer, Google Photos included, renders
+            # it unrotated. Treating it as malformed excluded real photos.
+            if orientation == 0:
+                orientation = 1
             if orientation not in range(1, 9):
                 skip_reason = "malformed EXIF orientation metadata"
             elif orientation in (5, 6, 7, 8):

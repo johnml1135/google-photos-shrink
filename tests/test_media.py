@@ -437,3 +437,30 @@ def test_unsupported_raw_or_unknown_media_is_skipped_safely(tmp_path: Path) -> N
     assert result["skip_reason"]
     with pytest.raises(UnsupportedMediaError):
         encode(source, tmp_path / "out.avif", PHOTO_SETTINGS)
+
+
+def test_probe_treats_unspecified_orientation_zero_as_upright(tmp_path: Path) -> None:
+    """Orientation 0 is out of spec but common: cameras write it for "not set".
+
+    Every viewer, Google Photos included, renders it unrotated. Rejecting it
+    excluded real photos -- including 50MP originals, the best savings targets.
+    """
+
+    pil = pytest.importorskip("PIL.Image")
+    source = tmp_path / "unspecified.jpg"
+    exif = pil.Exif()
+    exif[274] = 0
+    pil.new("RGB", (60, 40), "blue").save(source, exif=exif)
+
+    info = probe(source)
+    assert info["skip_reason"] is None
+    assert (info["width"], info["height"]) == (60, 40), "0 must not swap the axes"
+
+
+def test_probe_still_rejects_an_out_of_range_orientation(tmp_path: Path) -> None:
+    pil = pytest.importorskip("PIL.Image")
+    source = tmp_path / "bogus.jpg"
+    exif = pil.Exif()
+    exif[274] = 99
+    pil.new("RGB", (60, 40), "blue").save(source, exif=exif)
+    assert probe(source)["skip_reason"] == "malformed EXIF orientation metadata"
