@@ -54,6 +54,12 @@ EXTRA_TYPES = {
 MAX_PHOTO_BYTES = 200 * 1024 * 1024
 MAX_VIDEO_BYTES = 20 * 1024 * 1024 * 1024
 
+# Statuses worth trying again: a conflict, a rate limit, or a server fault are
+# all transient. Everything else is a real answer and retrying only repeats it.
+# Observed live: roughly one 409 "operation was aborted" per 500 uploads.
+RETRY_STATUSES = frozenset({409, 429, 500, 502, 503, 504})
+MAX_ATTEMPTS = 4
+
 
 class PhotosApiError(RuntimeError):
     """Raised when the Photos API cannot be used safely."""
@@ -348,12 +354,18 @@ class PhotosApiClient:
         if album_id:
             body["albumId"] = album_id
 
-        response = self.session.post(
-            f"{API_ROOT}/mediaItems:batchCreate",
-            headers=self._headers(**{"Content-type": "application/json"}),
-            json=body,
-            timeout=self.timeout,
-        )
+        # The upload token stays valid for a day, so re-sending the same token
+        # after a transient failure creates the item once, never twice.
+        for attempt in range(1, MAX_ATTEMPTS + 1):
+            response = self.session.post(
+                f"{API_ROOT}/mediaItems:batchCreate",
+                headers=self._headers(**{"Content-type": "application/json"}),
+                json=body,
+                timeout=self.timeout,
+            )
+            if response.status_code not in RETRY_STATUSES or attempt == MAX_ATTEMPTS:
+                break
+            time.sleep(min(2 ** attempt, 15))
         payload = self._json(response, "media item creation")
         results = payload.get("newMediaItemResults") or []
         if not results:

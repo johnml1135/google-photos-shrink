@@ -250,3 +250,52 @@ class TestLoadClientCredentials:
         monkeypatch.delenv("PHOTOS_API_CLIENT_SECRET", raising=False)
         with pytest.raises(PhotosApiError, match="setup_google_api"):
             load_client_credentials(tmp_path)
+
+
+class TestTransientRetry:
+    def test_a_transient_conflict_is_retried_and_succeeds(self, tmp_path, monkeypatch):
+        """A 409 "operation was aborted" appeared about once per 500 live uploads."""
+
+        monkeypatch.setattr("photos_shrink.photos_api.time.sleep", lambda _s: None)
+        session = Session()
+        session.post_responses = [
+            access_ok(),
+            Response(409, {"error": {"message": "The operation was aborted."}}),
+            Response(200, {"newMediaItemResults": [{"status": {}, "mediaItem": {"id": "new-1"}}]}),
+        ]
+        api = client(tmp_path, session)
+        assert api.create_media_item("tok", "p.avif")["id"] == "new-1"
+
+    def test_the_same_upload_token_is_resent_so_no_duplicate_is_created(self, tmp_path, monkeypatch):
+        monkeypatch.setattr("photos_shrink.photos_api.time.sleep", lambda _s: None)
+        session = Session()
+        session.post_responses = [
+            access_ok(),
+            Response(503, {"error": {"message": "backend unavailable"}}),
+            Response(200, {"newMediaItemResults": [{"status": {}, "mediaItem": {"id": "new-1"}}]}),
+        ]
+        api = client(tmp_path, session)
+        api.create_media_item("tok", "p.avif")
+        tokens = [
+            call[1]["json"]["newMediaItems"][0]["simpleMediaItem"]["uploadToken"]
+            for call in session.posts[1:]
+        ]
+        assert tokens == ["tok", "tok"]
+
+    def test_a_real_rejection_is_not_retried(self, tmp_path, monkeypatch):
+        monkeypatch.setattr("photos_shrink.photos_api.time.sleep", lambda _s: None)
+        session = Session()
+        session.post_responses = [access_ok(), Response(403, {"error": {"message": "insufficient scope"}})]
+        api = client(tmp_path, session)
+        with pytest.raises(PhotosApiError, match="insufficient scope"):
+            api.create_media_item("tok", "p.avif")
+        assert len(session.posts) == 2, "a permission failure must not be retried"
+
+    def test_retries_are_bounded(self, tmp_path, monkeypatch):
+        monkeypatch.setattr("photos_shrink.photos_api.time.sleep", lambda _s: None)
+        session = Session()
+        session.post_responses = [access_ok()] + [Response(503, {"error": {}})] * 10
+        api = client(tmp_path, session)
+        with pytest.raises(PhotosApiError):
+            api.create_media_item("tok", "p.avif")
+        assert len(session.posts) == 1 + 4
