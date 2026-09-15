@@ -44,24 +44,15 @@ class ReplaceError(RuntimeError):
     """Raised when a replacement cannot be completed safely."""
 
 
-def check_identity(
-    original: dict[str, Any],
-    replacement: dict[str, Any],
-    *,
-    error: type[Exception] = ReplaceError,
-) -> None:
+def check_identity(original: dict[str, Any], replacement: dict[str, Any]) -> None:
     """Refuse to mutate or trash anything that is not a distinct new item.
 
-    Shared by both callers that are ever allowed to trash or restore metadata
-    onto an item -- this module and `pipeline.Pipeline`. `error` lets the
-    pipeline caller keep raising its own `PipelineError` without a second copy
-    of the logic existing anywhere.
     """
 
     if not replacement or str(replacement.get("id")) == str(original.get("id")):
-        raise error("replacement identity is not distinct from original")
+        raise ReplaceError("replacement identity is not distinct from original")
     if original.get("dedup_key") and replacement.get("dedup_key") == original.get("dedup_key"):
-        raise error("replacement carries the original deduplication identity")
+        raise ReplaceError("replacement carries the original deduplication identity")
 
 
 def confirm_original(library: Any, source: Path, media_key: str) -> dict[str, Any]:

@@ -1,9 +1,12 @@
-"""Google Photos remote adapter.
+"""Google Photos remote adapter: the browser-cookie half of the library.
 
-This module contains the small ordinary-dictionary seam consumed by the
-pipeline.  gpwc remains the read/metadata/trash client; Playwright is used for
-session refresh and uploads because the pinned gpwc revision intentionally has
-no upload API.
+Uploads go through the official API (`photos_api`), which cannot write album
+membership or delete. Everything that needs those -- identifying an item by
+content hash, restoring its metadata onto a replacement, and trashing the
+original -- has to come through here, on an exported browser session.
+
+gpwc is the read/metadata/trash client; Playwright refreshes the session when
+the exported cookies go stale, which they do within about fifteen minutes.
 """
 
 from __future__ import annotations
@@ -16,7 +19,7 @@ import mimetypes
 import os
 import tempfile
 import time
-from collections.abc import Callable, Iterable
+from collections.abc import Callable
 from dataclasses import asdict, is_dataclass
 from pathlib import Path
 from typing import Any
@@ -25,7 +28,6 @@ from urllib.parse import urlparse
 from .auth import (
     BrowserAuthenticator,
     NetscapeCookie,
-    UploadNotStartedError,
     write_netscape_cookies,
 )
 from .integrity import sha256_file
@@ -70,7 +72,6 @@ class GooglePhotosRemote:
         self._browser = browser
         self._library_context: dict[str, Any] = {}
         self._trusted_media: set[str] = set()
-        self._upload_in_progress = False
         self._last_refresh_monotonic = time.monotonic()
         self._session_refresh_seconds = self._refresh_interval()
 
@@ -256,8 +257,6 @@ class GooglePhotosRemote:
     def refresh_session(self) -> None:
         """Refresh browser authentication and atomically install it in gpwc."""
 
-        if self._upload_in_progress:
-            return
         try:
             self._load_dependencies()
             if self._client is None:
@@ -312,7 +311,7 @@ class GooglePhotosRemote:
             raise SessionRefreshError("Google Photos session refresh failed") from exc
 
     def _maybe_refresh(self) -> None:
-        if self._upload_in_progress or self._session_refresh_seconds <= 0:
+        if self._session_refresh_seconds <= 0:
             return
         if not self._refresh_due():
             return
@@ -366,13 +365,6 @@ class GooglePhotosRemote:
             raise RemoteProtocolError(f"Google Photos returned an empty response rpc={rpc_name}")
         return data
 
-    def register_replacements(self, ids: Iterable[str]) -> None:
-        """Trust replacement IDs recovered from the newest journal state."""
-
-        for media_id in ids:
-            if isinstance(media_id, str) and media_id:
-                self._trusted_media.add(media_id)
-
     def _execute(self, payload: Any) -> Any:
         if self._client is None:
             self.login()
@@ -381,7 +373,7 @@ class GooglePhotosRemote:
         try:
             return self._request(payload)
         except RemoteProtocolError as original:
-            if not self._is_read_only(payload) or self._upload_in_progress or self._session_refresh_seconds <= 0:
+            if not self._is_read_only(payload) or self._session_refresh_seconds <= 0:
                 raise
             try:
                 self.refresh_session()
@@ -406,69 +398,6 @@ class GooglePhotosRemote:
             session._photos_shrink_timeout = True
         except (AttributeError, TypeError):
             pass
-
-    @staticmethod
-    def _page_items(data: Any) -> tuple[list[Any], str | None]:
-        items = getattr(data, "items", None)
-        if not isinstance(items, list):
-            raise RemoteProtocolError("Google Photos returned a malformed page")
-        token = getattr(data, "next_page_id", None)
-        if token is not None and not isinstance(token, str):
-            raise RemoteProtocolError("Google Photos returned a malformed page token")
-        return items, token
-
-    def list_items(self) -> Iterable[dict[str, Any]]:
-        self._load_dependencies()
-        configured_limit = self.settings.get("run", {}).get("limit", 0)
-        page_size = 500
-        if isinstance(configured_limit, int) and not isinstance(configured_limit, bool) and configured_limit > 0:
-            page_size = min(500, max(15, configured_limit * 5))
-        page_id: str | None = None
-        seen: set[str] = set()
-        seen_pages: set[str] = set()
-        yielded = 0
-        while True:
-            page = self._execute(
-                self._payloads.GetLibraryPageByTakenDate(
-                    page_id=page_id, source="both", page_size=page_size
-                )
-            )
-            library_items, next_page = self._page_items(page)
-            for library_item in library_items:
-                media_key = getattr(library_item, "media_key", None)
-                if not isinstance(media_key, str) or not media_key or media_key in seen:
-                    continue
-                seen.add(media_key)
-                yielded += 1
-                self._library_context[media_key] = library_item
-                try:
-                    yield self._item_for_media(media_key, library_item)
-                except SessionRefreshError:
-                    raise
-                except RemoteProtocolError as exc:
-                    # A malformed item must be visible to the planner and can
-                    # never be interpreted as a candidate for deletion.
-                    yield {
-                        "id": media_key,
-                        "dedup_key": getattr(library_item, "dedup_key", None),
-                        "filename": None,
-                        "size_bytes": None,
-                        "width": None,
-                        "height": None,
-                        "kind": None,
-                        "timestamp_ms": getattr(library_item, "timestamp", None),
-                        "timezone_offset": getattr(library_item, "timezone_offset", None),
-                        "duration_seconds": None,
-                        "mime_type": None,
-                        "metadata": {},
-                        "skip_reason": str(exc),
-                    }
-            if not next_page:
-                break
-            if next_page in seen_pages:
-                raise RemoteProtocolError("Google Photos pagination repeated a page token")
-            seen_pages.add(next_page)
-            page_id = next_page
 
     def _item_for_media(self, media_key: str, library_item: Any | None = None) -> dict[str, Any]:
         info = self._execute(self._payloads.GetItemInfo(media_key))
@@ -779,83 +708,6 @@ class GooglePhotosRemote:
                 raise RemoteProtocolError(
                     "Google Photos changed uploaded bytes; select Original quality and retry"
                 )
-
-    def upload(self, path: str | os.PathLike[str]) -> dict[str, Any]:
-        file_path = Path(path)
-        if not file_path.is_file() or file_path.stat().st_size == 0:
-            raise RemoteProtocolError("upload source is missing or empty")
-        if self._browser is None:
-            try:
-                self._browser = BrowserAuthenticator(self.settings)
-            except UploadNotStartedError:
-                raise
-            except Exception as exc:  # noqa: BLE001 - browser setup varies by environment
-                raise UploadNotStartedError("browser upload setup failed") from exc
-        try:
-            client_identity = self.account_id()
-        except UploadNotStartedError:
-            raise
-        except Exception as exc:  # noqa: BLE001 - session failures vary by upstream
-            raise UploadNotStartedError("Google account check failed before upload") from exc
-        if self._refresh_due() and callable(getattr(self._browser, "refresh_session", None)):
-            try:
-                self.refresh_session()
-                client_identity = self.account_id()
-            except Exception as exc:  # noqa: BLE001 - browser/session failures vary
-                raise UploadNotStartedError("Google session refresh failed before upload") from exc
-        try:
-            browser_identity = self._browser.open(interactive=False)
-        except UploadNotStartedError:
-            raise
-        except Exception as exc:  # noqa: BLE001 - browser startup varies by environment
-            raise UploadNotStartedError("browser session could not be opened") from exc
-        if browser_identity != client_identity:
-            raise UploadNotStartedError("browser and gpwc sessions are authenticated to different accounts")
-        if bool(self.google.get("auto_original_quality", True)):
-            try:
-                ensure = getattr(self._browser, "ensure_original_quality", None)
-                if not callable(ensure):
-                    raise UploadNotStartedError("Original quality control is unavailable")
-                ensure(client_identity)
-            except UploadNotStartedError:
-                raise
-            except Exception as exc:  # noqa: BLE001 - browser/UI failures vary
-                raise UploadNotStartedError("Original quality preflight failed") from exc
-        self._upload_in_progress = True
-        try:
-            self._browser.upload(file_path)
-            timeout = float(self.google.get("upload_timeout_seconds", 120))
-            poll_seconds = float(self.google.get("upload_poll_seconds", 1))
-            readiness_poll_seconds = max(poll_seconds, 3.0)
-            deadline = time.monotonic() + timeout
-            expected_sha = sha256_file(file_path)
-            match = None
-            last_readiness_error: RemoteProtocolError | None = None
-            while time.monotonic() < deadline:
-                if match is None:
-                    try:
-                        match = self.find_uploaded(file_path)
-                    except RemoteProtocolError as exc:
-                        last_readiness_error = exc
-                if match is not None:
-                    self._trusted_media.add(match["id"])
-                    try:
-                        verified = self.get_item(match["id"])
-                        if verified.get("size_bytes") != file_path.stat().st_size:
-                            raise RemoteProtocolError("uploaded item size does not match local bytes")
-                        self._verify_remote_bytes(verified, expected_sha)
-                        verified["content_hash"] = match.get("content_hash")
-                        verified["sha256"] = expected_sha
-                        return verified
-                    except RemoteProtocolError as exc:
-                        last_readiness_error = exc
-                wait_seconds = readiness_poll_seconds if match is not None else poll_seconds
-                time.sleep(min(wait_seconds, max(0, deadline - time.monotonic())))
-            if last_readiness_error is not None:
-                raise RemoteProtocolError(f"uploaded item readiness timed out: {last_readiness_error}") from last_readiness_error
-            raise RemoteProtocolError("uploaded item could not be resolved by exact content hash")
-        finally:
-            self._upload_in_progress = False
 
     def restore_metadata(self, original: dict[str, Any], replacement: dict[str, Any]) -> None:
         dedup = replacement.get("dedup_key")

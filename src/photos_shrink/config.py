@@ -26,8 +26,7 @@ DEFAULTS: dict[str, dict[str, Any]] = {
     "tools": {"ffmpeg": "ffmpeg", "ffprobe": "ffprobe"},
     "google": {"cookies_file": ".photos-shrink/cookies.txt", "browser_profile": ".photos-shrink/browser",
                "browser_channel": "chrome", "browser_headless": True, "account_index": 0,
-               "session_refresh_seconds": 300, "upload_timeout_seconds": 300,
-               "upload_poll_seconds": 5, "auto_original_quality": True},
+               "session_refresh_seconds": 300},
     "run": {"work_dir": ".photos-shrink", "pause_seconds": 10, "minimum_savings_percent": 20,
             "threads": 2, "skip_shared": True, "limit": 0, "skip_non_space_consuming": True,
             "photos_only": False, "selection_order": "largest"},
@@ -120,11 +119,7 @@ def load_config(path: str | os.PathLike[str] = "shrink.toml") -> Settings:
         raise ConfigError("google.account_index must be an integer >= 0")
     if not isinstance(values["google"]["browser_headless"], bool):
         raise ConfigError("google.browser_headless must be a boolean")
-    if not isinstance(values["google"]["auto_original_quality"], bool):
-        raise ConfigError("google.auto_original_quality must be a boolean")
     _positive_int(values["google"]["session_refresh_seconds"], "google.session_refresh_seconds")
-    _positive_int(values["google"]["upload_timeout_seconds"], "google.upload_timeout_seconds", 1)
-    _positive_int(values["google"]["upload_poll_seconds"], "google.upload_poll_seconds", 1)
     _positive_int(values["photos"]["short_edge"], "photos.short_edge", 1)
     _positive_int(values["photos"]["quality"], "photos.quality", 1)
     if values["photos"]["quality"] > 100:

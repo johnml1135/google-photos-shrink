@@ -162,16 +162,6 @@ class TestCheckIdentity:
     def test_accepts_a_distinct_replacement(self):
         check_identity({"id": "A", "dedup_key": "D1"}, {"id": "B", "dedup_key": "D2"})
 
-    def test_can_raise_a_different_exception_type_for_a_different_caller(self):
-        """pipeline.Pipeline shares this function but must keep raising PipelineError."""
-
-        class OtherError(RuntimeError):
-            pass
-
-        with pytest.raises(OtherError, match="not distinct"):
-            check_identity({"id": "A"}, {"id": "A"}, error=OtherError)
-
-
 class TestOutputInfo:
     def test_supplies_the_hash_and_path_verification_requires(self, tmp_path, monkeypatch):
         from photos_shrink.integrity import sha256_file

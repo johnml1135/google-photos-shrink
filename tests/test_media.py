@@ -338,43 +338,6 @@ def test_video_probe_and_encode_are_rotation_aware_and_fps_is_a_cap(
 
 
 @pytest.mark.skipif(not _ffmpeg_available(), reason="FFmpeg is unavailable")
-def test_video_estimate_samples_multiple_positions(tmp_path: Path) -> None:
-    source = tmp_path / "long.mp4"
-    subprocess.run(
-        [
-            PHOTO_SETTINGS["tools"]["ffmpeg"],
-            "-v",
-            "error",
-            "-f",
-            "lavfi",
-            "-i",
-            "testsrc=size=64x48:rate=6",
-            "-t",
-            "11",
-            "-c:v",
-            "libx264",
-            "-pix_fmt",
-            "yuv420p",
-            str(source),
-        ],
-        check=True,
-    )
-    from photos_shrink.media import estimate
-
-    result = estimate(
-        source,
-        {
-            **PHOTO_SETTINGS,
-            "videos": {**PHOTO_SETTINGS["videos"], "preset": "ultrafast"},
-        },
-        tmp_path / "work",
-    )
-    assert result["method"] == "sample_encode"
-    assert result["sample_count"] == 3
-    assert result["estimated_bytes"] > 0
-
-
-@pytest.mark.skipif(not _ffmpeg_available(), reason="FFmpeg is unavailable")
 def test_verify_rejects_large_duration_truncation(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

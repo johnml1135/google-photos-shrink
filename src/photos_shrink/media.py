@@ -6,7 +6,6 @@ import json
 import math
 import os
 import subprocess
-import tempfile
 from pathlib import Path
 from typing import Any
 
@@ -482,57 +481,9 @@ def encode(
         raise UnsupportedMediaError(input_info["skip_reason"] or "unsupported media")
     output_info = probe(destination_path, _tool(settings, "ffprobe", "ffprobe"))
     digest = _sha256(destination_path)
-    # Keep the probe fields flat at the media/pipeline seam.  The aliases make
+    # Keep the probe fields flat at the media seam.  The aliases make
     # this usable by callers written against the original draft contract.
     return {**output_info, "sha256": digest, "output_sha256": digest}
-
-
-def estimate(
-    source: str | os.PathLike[str],
-    settings: dict[str, Any],
-    work_dir: str | os.PathLike[str],
-) -> dict[str, Any]:
-    """Estimate output bytes using an exact photo encode or a video sample."""
-    source_path = Path(source)
-    work = Path(work_dir)
-    work.mkdir(parents=True, exist_ok=True)
-    info = probe(source_path, _tool(settings, "ffprobe", "ffprobe"))
-    suffix = ".avif" if info["kind"] == "photo" else ".mp4"
-    with tempfile.TemporaryDirectory(dir=work) as temp:
-        sampled = Path(temp) / f"sample{suffix}"
-        if info["kind"] == "photo":
-            encode(source_path, sampled, settings)
-            return {"estimated_bytes": sampled.stat().st_size, "method": "exact_encode"}
-        if info["kind"] != "video" or info["skip_reason"]:
-            raise UnsupportedMediaError(info["skip_reason"] or "unsupported media")
-        duration = float(info["duration_seconds"] or 0)
-        sample_duration = min(duration, 10.0) if duration > 0 else 10.0
-        positions = [0.0]
-        if duration > sample_duration:
-            positions += [
-                max(0.0, duration / 2 - sample_duration / 2),
-                max(0.0, duration - sample_duration),
-            ]
-        rates: list[float] = []
-        sample_bytes = 0
-        for index, position in enumerate(dict.fromkeys(positions)):
-            sample_path = Path(temp) / f"sample-{index}.mp4"
-            _encode_video(source_path, sample_path, settings, sample_duration, position)
-            current_bytes = sample_path.stat().st_size
-            sample_bytes += current_bytes
-            rates.append(current_bytes / sample_duration)
-        estimated = (
-            int(round(sum(rates) / len(rates) * duration))
-            if duration and rates
-            else sample_bytes
-        )
-        return {
-            "estimated_bytes": estimated,
-            "method": "sample_encode",
-            "sampled_bytes": sample_bytes,
-            "sample_duration_seconds": sample_duration,
-            "sample_count": len(rates),
-        }
 
 
 def _decode_fully(path: Path, info: dict[str, Any], settings: dict[str, Any]) -> None:

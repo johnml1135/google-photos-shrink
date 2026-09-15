@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import re
 from http.cookiejar import MozillaCookieJar
 from pathlib import Path
 
@@ -11,7 +10,6 @@ from photos_shrink.auth import (
     BrowserAuthenticator,
     BrowserAuthError,
     NetscapeCookie,
-    UploadNotStartedError,
     load_netscape_cookies,
     write_netscape_cookies,
 )
@@ -104,102 +102,6 @@ def test_interactive_login_waits_for_photos_origin_before_accepting_identity(tmp
     assert len(page.waits) == 1
     assert "location.hostname === 'photos.google.com'" in page.waits[0][0]
     auth.close()
-
-
-def test_upload_uses_add_menu_then_import_menuitem_file_chooser(tmp_path: Path):
-    class Locator:
-        def __init__(self, count=0):
-            self.count_value = count
-            self.calls = []
-
-        def count(self):
-            return self.count_value
-
-        def click(self):
-            self.calls.append("click")
-
-    class Chooser:
-        def __init__(self):
-            self.paths = []
-
-        def set_files(self, path):
-            self.paths.append(path)
-
-    class ExpectChooser:
-        def __init__(self, chooser):
-            self.chooser = chooser
-
-        def __enter__(self):
-            return self
-
-        def __exit__(self, exc_type, exc_value, traceback):
-            return False
-
-        @property
-        def value(self):
-            return self.chooser
-
-    class Page:
-        def __init__(self):
-            self.file_inputs = Locator()
-            self.add_button = Locator()
-            self.import_menuitem = Locator()
-            self.chooser = Chooser()
-            self.role_calls = []
-
-        def locator(self, selector):
-            assert selector == 'input[type="file"]'
-            return self.file_inputs
-
-        def get_by_role(self, role, *, name, exact):
-            self.role_calls.append((role, name, exact))
-            if role == "button":
-                return self.add_button
-            return self.import_menuitem
-
-        def expect_file_chooser(self, *, timeout):
-            assert timeout == 10000
-            return ExpectChooser(self.chooser)
-
-    page = Page()
-    auth = BrowserAuthenticator({"google": {"browser_profile": str(tmp_path / "profile")}})
-    auth.page = page
-    path = tmp_path / "photo.jpg"
-    path.write_bytes(b"photo")
-
-    auth.upload(path)
-
-    assert page.role_calls == [
-        ("button", "Create and add photos", True),
-        ("menuitem", "Import photos from your computer", True),
-    ]
-    assert page.add_button.calls == ["click"]
-    assert page.import_menuitem.calls == ["click"]
-    assert page.chooser.paths == [str(path.resolve())]
-
-
-def test_upload_control_failure_is_marked_before_submission(tmp_path: Path):
-    class Locator:
-        def count(self):
-            return 0
-
-        def click(self):
-            raise AssertionError("button click should not be attempted")
-
-    class Page:
-        def locator(self, selector):
-            return Locator()
-
-        def get_by_role(self, role, *, name, exact):
-            return Locator()
-
-    auth = BrowserAuthenticator({"google": {"browser_profile": str(tmp_path / "profile")}})
-    auth.page = Page()
-    path = tmp_path / "photo.jpg"
-    path.write_bytes(b"photo")
-
-    with pytest.raises(UploadNotStartedError):
-        auth.upload(path)
 
 
 @pytest.mark.parametrize("headless, expected", [(True, True), (False, False)])
@@ -413,109 +315,3 @@ def test_open_can_skip_stale_seed_cookie_import(tmp_path: Path):
 
     assert auth.open(seed_cookies=False) == "account"
     auth.close()
-
-
-def test_ensure_original_quality_selects_and_verifies_setting(tmp_path: Path):
-    class Radio:
-        def __init__(self):
-            self.checked = False
-            self.checks = 0
-
-        def is_checked(self):
-            return self.checked
-
-        def count(self):
-            return 1
-
-        def check(self):
-            self.checks += 1
-            self.checked = True
-
-    class Page:
-        url = "https://photos.google.com/"
-
-        def __init__(self):
-            self.radio = Radio()
-            self.goto_calls = []
-            self.reloads = 0
-
-        def evaluate(self, expression):
-            return "account"
-
-        def goto(self, url, wait_until=None):
-            self.goto_calls.append((url, wait_until))
-            self.url = url
-
-        def reload(self, *, wait_until):
-            self.reloads += 1
-
-        def get_by_role(self, role, *, name):
-            assert role == "radio"
-            assert re.match(name, "Original quality")
-            return self.radio
-
-    page = Page()
-    auth = BrowserAuthenticator({"google": {"browser_profile": str(tmp_path / "profile")}})
-    auth.page = page
-    auth.context = object()
-
-    auth.ensure_original_quality("account")
-
-    assert page.radio.checks == 1
-    assert page.reloads == 1
-    assert page.goto_calls == [
-        ("https://photos.google.com/settings", "domcontentloaded"),
-        ("https://photos.google.com/", "domcontentloaded"),
-    ]
-
-
-def test_ensure_original_quality_is_idempotent_when_already_selected(tmp_path: Path):
-    class Radio:
-        def count(self):
-            return 1
-
-        def is_checked(self):
-            return True
-
-        def check(self):
-            raise AssertionError("already selected radio must not be checked")
-
-    class Page:
-        url = "https://photos.google.com/settings"
-
-        def evaluate(self, expression):
-            return "account"
-
-        def get_by_role(self, role, *, name):
-            return Radio()
-
-        def reload(self, *, wait_until):
-            pass
-
-        def goto(self, url, wait_until=None):
-            self.url = url
-
-    auth = BrowserAuthenticator({"google": {"browser_profile": str(tmp_path / "profile")}})
-    auth.page = Page()
-    auth.context = object()
-    auth.ensure_original_quality("account")
-
-
-def test_ensure_original_quality_fails_closed_when_control_is_missing(tmp_path: Path):
-    class Page:
-        url = "https://photos.google.com/settings"
-
-        def evaluate(self, expression):
-            return "account"
-
-        def get_by_role(self, role, *, name):
-            raise RuntimeError("not found")
-
-        def goto(self, url, wait_until=None):
-            self.url = url
-
-    auth = BrowserAuthenticator({"google": {"browser_profile": str(tmp_path / "profile")}})
-    auth.page = Page()
-    auth.context = object()
-    with pytest.raises(BrowserAuthError, match="Original quality"):
-        auth.ensure_original_quality("account")

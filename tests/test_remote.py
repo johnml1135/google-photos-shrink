@@ -10,8 +10,6 @@ import pytest
 import requests
 
 from photos_shrink.auth import (
-    BrowserAuthError,
-    UploadNotStartedError,
     load_netscape_cookies,
 )
 from photos_shrink.integrity import sha256_file
@@ -451,43 +449,6 @@ def test_execute_skips_refresh_while_upload_is_active(tmp_path, monkeypatch):
     assert refreshes == []
 
 
-def test_small_run_limit_requests_a_small_initial_library_page(tmp_path):
-    configured = settings(tmp_path)
-    configured["run"] = {"limit": 3}
-    remote = GooglePhotosRemote(configured, client=Client(), payloads=Payloads)
-    requests = []
-
-    def execute(payload):
-        requests.append(payload)
-        return type("Page", (), {"items": [], "next_page_id": None})()
-
-    remote._execute = execute
-
-    assert list(remote.list_items()) == []
-    assert requests[0].page_size == 15
-
-
-def test_small_run_limit_paginates_full_inventory_with_small_pages(tmp_path):
-    configured = settings(tmp_path)
-    configured["run"] = {"limit": 3}
-    remote = GooglePhotosRemote(configured, client=Client(), payloads=Payloads)
-    first_page = [type("Item", (), {"media_key": str(index)})() for index in range(15)]
-    second_page = [type("Item", (), {"media_key": "15"})()]
-    requests = []
-
-    def execute(payload):
-        requests.append(payload)
-        if payload.page_id is None:
-            return type("Page", (), {"items": first_page, "next_page_id": "another-page"})()
-        return type("Page", (), {"items": second_page, "next_page_id": None})()
-
-    remote._execute = execute
-    remote._item_for_media = lambda media_key, library_item: {"id": media_key}
-
-    assert len(list(remote.list_items())) == 16
-    assert len(requests) == 2
-
-
 def test_find_uploaded_uses_sha1_base64_and_rejects_malformed_success(tmp_path):
     path = tmp_path / "encoded.jpg"
     path.write_bytes(b"encoded bytes")
@@ -556,79 +517,6 @@ def test_trash_fails_closed_when_item_identity_or_metadata_is_uncertain(tmp_path
     assert client.calls == []
 
 
-def test_upload_refuses_browser_session_for_a_different_account(tmp_path):
-    path = tmp_path / "encoded.jpg"
-    path.write_bytes(b"encoded bytes")
-
-    class Browser:
-        def open(self, *, interactive=False):
-            return "other-account"
-
-        def upload(self, path):
-            raise AssertionError("upload must not start")
-
-        def close(self):
-            pass
-
-    with pytest.raises(UploadNotStartedError, match="different accounts"):
-        GooglePhotosRemote(settings(tmp_path), client=Client(), payloads=Payloads, browser=Browser()).upload(path)
-
-
-def test_upload_quality_preflight_failure_prevents_file_submission(tmp_path):
-    path = tmp_path / "encoded.jpg"
-    path.write_bytes(b"encoded bytes")
-    calls = []
-
-    class Browser:
-        def open(self, *, interactive=False):
-            return "stable-account"
-
-        def ensure_original_quality(self, expected_account):
-            calls.append(expected_account)
-            raise BrowserAuthError("Original quality control is unavailable")
-
-        def upload(self, path):
-            raise AssertionError("upload must not start when quality preflight fails")
-
-        def close(self):
-            pass
-
-    configured = settings(tmp_path)
-    configured["google"]["auto_original_quality"] = True
-    with pytest.raises(UploadNotStartedError, match="quality preflight"):
-        GooglePhotosRemote(configured, client=Client(), payloads=Payloads, browser=Browser()).upload(path)
-    assert calls == ["stable-account"]
-
-
-@pytest.mark.parametrize("failure", ["construct", "account", "open"])
-def test_upload_pre_submission_failures_are_retryable(tmp_path, monkeypatch, failure):
-    path = tmp_path / "encoded.jpg"
-    path.write_bytes(b"encoded bytes")
-
-    class Browser:
-        def __init__(self, settings):
-            if failure == "construct":
-                raise ValueError("browser setup failed")
-
-        def open(self, *, interactive=False):
-            if failure == "open":
-                raise ValueError("browser open failed")
-            return "stable-account"
-
-        def upload(self, path):
-            raise AssertionError("upload must not start")
-
-        def close(self):
-            pass
-
-    client = Client()
-    if failure == "account":
-        client.global_data = {}
-    monkeypatch.setattr("photos_shrink.remote.BrowserAuthenticator", Browser)
-    with pytest.raises(UploadNotStartedError):
-        GooglePhotosRemote(settings(tmp_path), client=client, payloads=Payloads).upload(path)
-
-
 def _upload_remote(tmp_path, *, timeout=0.05, poll=0.001):
     path = tmp_path / "encoded.jpg"
     path.write_bytes(b"encoded")
@@ -653,68 +541,6 @@ def _upload_remote(tmp_path, *, timeout=0.05, poll=0.001):
     client = Client()
     remote = GooglePhotosRemote(configured, client=client, payloads=Payloads, browser=Browser())
     return remote, path
-
-
-def test_upload_polls_readiness_after_exact_hash_until_bytes_are_available(tmp_path, monkeypatch):
-    monkeypatch.setattr("photos_shrink.remote.time.sleep", lambda seconds: None)
-    remote, path = _upload_remote(tmp_path)
-    match = {"id": "replacement", "content_hash": "hash"}
-    verified = {"id": "replacement", "size_bytes": path.stat().st_size, "is_original_quality": False}
-    remote.find_uploaded = lambda path: match
-    remote.get_item = lambda id: verified
-    checks = []
-
-    def verify(item, expected_sha):
-        checks.append(remote._upload_in_progress)
-        if len(checks) == 1:
-            raise RemoteProtocolError("original bytes are not ready")
-
-    remote._verify_remote_bytes = verify
-    result = remote.upload(path)
-
-    assert result["id"] == "replacement"
-    assert len(checks) == 2
-    assert all(checks)
-    assert remote._browser.uploads == 1
-
-
-def test_upload_readiness_failure_is_bounded_and_reports_last_reason(tmp_path, monkeypatch):
-    monkeypatch.setattr("photos_shrink.remote.time.sleep", lambda seconds: None)
-    remote, path = _upload_remote(tmp_path, timeout=0.02, poll=0.001)
-    match = {"id": "replacement", "content_hash": "hash"}
-    verified = {"id": "replacement", "size_bytes": path.stat().st_size, "is_original_quality": False}
-    remote.find_uploaded = lambda path: match
-    remote.get_item = lambda id: verified
-    checks = []
-    remote._verify_remote_bytes = lambda item, expected_sha: checks.append(True) or (_ for _ in ()).throw(
-        RemoteProtocolError("original bytes are not ready")
-    )
-
-    with pytest.raises(RemoteProtocolError, match="readiness.*original bytes are not ready"):
-        remote.upload(path)
-
-    assert len(checks) > 1
-    assert remote._browser.uploads == 1
-    assert remote._upload_in_progress is False
-
-
-def test_upload_readiness_does_not_refresh_browser_during_active_upload(tmp_path, monkeypatch):
-    monkeypatch.setattr("photos_shrink.remote.time.sleep", lambda seconds: None)
-    remote, path = _upload_remote(tmp_path)
-    match = {"id": "replacement", "content_hash": "hash"}
-    verified = {"id": "replacement", "size_bytes": path.stat().st_size, "is_original_quality": True}
-    remote.find_uploaded = lambda path: match
-    remote.get_item = lambda id: verified
-    remote._verify_remote_bytes = lambda item, expected_sha: None
-    refreshes = []
-    remote.refresh_session = lambda: refreshes.append(remote._upload_in_progress)
-    remote._last_refresh_monotonic = 0
-    remote._session_refresh_seconds = 0.001
-
-    result = remote.upload(path)
-
-    assert result["id"] == "replacement"
-    assert refreshes == []
 
 
 def test_trusted_upload_with_missing_source_is_safe(tmp_path):

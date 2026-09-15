@@ -1,6 +1,6 @@
 """The one question every replacement path must ask: can this be touched?
 
-Two call sites used to answer this question independently -- the main pipeline
+Two call sites used to answer this question independently -- the replace step
 (working from a live Google Photos item) and the Takeout encoder (working from
 a locally mirrored file) -- with different input shapes and, worse, different
 refusals. The encoder's gate was missing `photos_only`, `shared_album` and

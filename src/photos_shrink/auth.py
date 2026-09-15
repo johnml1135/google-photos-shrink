@@ -8,7 +8,6 @@ browser upload is attempted.
 from __future__ import annotations
 
 import os
-import re
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
@@ -91,10 +90,6 @@ def write_netscape_cookies(path: str | os.PathLike[str], cookies: list[NetscapeC
 
 class BrowserAuthError(RuntimeError):
     """Raised when browser authentication cannot establish a known account."""
-
-
-class UploadNotStartedError(BrowserAuthError):
-    """Raised when the upload controls fail before file submission begins."""
 
 
 class BrowserAuthenticator:
@@ -199,39 +194,6 @@ class BrowserAuthenticator:
         except Exception as exc:  # noqa: BLE001 - Playwright errors vary by browser
             raise BrowserAuthError("Google Photos browser session could not be refreshed") from exc
 
-    def ensure_original_quality(self, expected_account: str) -> None:
-        """Select and verify Original quality in the current Photos account."""
-
-        if self.page is None:
-            self.open(interactive=False)
-        if self.page is None:
-            raise BrowserAuthError("browser session is not open")
-        settings_url = f"{self.photos_url}settings"
-        try:
-            self.page.goto(settings_url, wait_until="domcontentloaded")
-            self._validate_photos_page(self.account_id(), expected_account=expected_account)
-            radio = self.page.get_by_role("radio", name=re.compile(r"^Original quality"))
-            if radio.count() != 1:
-                raise BrowserAuthError("Original quality control is unavailable")
-            if radio.is_checked():
-                selected = True
-            else:
-                radio.check()
-                self.page.reload(wait_until="domcontentloaded")
-                self._validate_photos_page(self.account_id(), expected_account=expected_account)
-                radio = self.page.get_by_role("radio", name=re.compile(r"^Original quality"))
-                if radio.count() != 1:
-                    raise BrowserAuthError("Original quality control is unavailable")
-                selected = radio.is_checked()
-            if not selected:
-                raise BrowserAuthError("Original quality could not be verified")
-            self.page.goto(self.photos_url, wait_until="domcontentloaded")
-            self._validate_photos_page(self.account_id(), expected_account=expected_account)
-        except BrowserAuthError:
-            raise
-        except Exception as exc:  # noqa: BLE001 - Playwright errors vary by UI state
-            raise BrowserAuthError("Original quality control is unavailable") from exc
-
     def _validate_photos_page(self, identity: str, *, expected_account: str | None = None) -> None:
         if not identity:
             raise BrowserAuthError("Google Photos browser session is not authenticated")
@@ -262,26 +224,6 @@ class BrowserAuthenticator:
         if not isinstance(value, (str, int)) or not str(value):
             return ""
         return str(value)
-
-    def upload(self, path: str | os.PathLike[str]) -> None:
-        if self.page is None:
-            self.open(interactive=False)
-        assert self.page is not None
-        file_path = str(Path(path).resolve())
-        inputs = self.page.locator('input[type="file"]')
-        if inputs.count() > 0:
-            inputs.first.set_input_files(file_path)
-            return
-        try:
-            self.page.get_by_role("button", name="Create and add photos", exact=True).click()
-            import_menuitem = self.page.get_by_role(
-                "menuitem", name="Import photos from your computer", exact=True
-            )
-            with self.page.expect_file_chooser(timeout=10000) as chooser_info:
-                import_menuitem.click()
-        except Exception as exc:  # noqa: BLE001 - Playwright errors vary by UI state
-            raise UploadNotStartedError("Google Photos upload control is unavailable") from exc
-        chooser_info.value.set_files(file_path)
 
     def _import_cookies(self) -> None:
         if self._cookies_imported or not self.cookies_file.is_file() or self.context is None:

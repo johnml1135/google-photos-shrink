@@ -23,9 +23,6 @@ browser_channel = "chrome"
 browser_headless = true
 account_index = 1
 session_refresh_seconds = 300
-upload_timeout_seconds = 300
-upload_poll_seconds = 5
-auto_original_quality = true
 
 [run]
 work_dir = ".photos-shrink"
