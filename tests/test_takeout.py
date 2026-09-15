@@ -172,3 +172,35 @@ class TestScan:
     def test_missing_root_raises(self, tmp_path):
         with pytest.raises(takeout.TakeoutError):
             list(takeout.scan(tmp_path / "nope"))
+
+
+class TestGooglePhotosLink:
+    def test_url_and_media_key_are_extracted(self, tmp_path):
+        path = tmp_path / "IMG_0001.jpg.json"
+        payload = sidecar_payload()
+        payload["url"] = "https://photos.google.com/photo/AF1QipOeLuraoBkmjO1DBzD0oU8s0U0QcHl8dawf3MEE"
+        write(path, payload)
+        fields = takeout.parse_sidecar(path)
+        assert fields["url"] == payload["url"]
+        assert fields["media_key"] == "AF1QipOeLuraoBkmjO1DBzD0oU8s0U0QcHl8dawf3MEE"
+
+    def test_missing_url_is_none(self, tmp_path):
+        path = tmp_path / "IMG_0001.jpg.json"
+        write(path, sidecar_payload())
+        fields = takeout.parse_sidecar(path)
+        assert fields["url"] is None and fields["media_key"] is None
+
+    def test_non_https_url_is_rejected(self, tmp_path):
+        path = tmp_path / "IMG_0001.jpg.json"
+        payload = sidecar_payload()
+        payload["url"] = "javascript:alert(1)"
+        write(path, payload)
+        assert takeout.parse_sidecar(path)["media_key"] is None
+
+    def test_scan_surfaces_the_link(self, tmp_path):
+        (tmp_path / "IMG_0001.jpg").write_bytes(b"x")
+        payload = sidecar_payload()
+        payload["url"] = "https://photos.google.com/photo/AF1QipABC"
+        write(tmp_path / "IMG_0001.jpg.json", payload)
+        record = list(takeout.scan(tmp_path))[0]
+        assert record.media_key == "AF1QipABC"

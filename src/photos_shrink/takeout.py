@@ -56,6 +56,8 @@ class TakeoutRecord:
     latitude: float | None = None
     longitude: float | None = None
     people: tuple[str, ...] = ()
+    url: str | None = None
+    media_key: str | None = None
     sha256: str | None = None
 
     @property
@@ -195,6 +197,13 @@ def parse_sidecar(path: str | Path) -> dict[str, Any]:
         if isinstance(entry, dict) and isinstance(entry.get("name"), str):
             people.append(entry["name"])
 
+    # The sidecar carries a direct link to the item in Google Photos, whose
+    # final path segment is the same media key the library uses. That gives a
+    # stable identity for every exported item without reading the library.
+    url = raw.get("url")
+    url = url if isinstance(url, str) and url.startswith("https://") else None
+    media_key = url.rstrip("/").rsplit("/", 1)[-1] if url else None
+
     title = raw.get("title")
     return {
         "title": title if isinstance(title, str) and title else None,
@@ -202,6 +211,8 @@ def parse_sidecar(path: str | Path) -> dict[str, Any]:
         "latitude": latitude,
         "longitude": longitude,
         "people": tuple(people),
+        "url": url,
+        "media_key": media_key,
     }
 
 
@@ -262,6 +273,8 @@ def scan(root: str | Path, *, compute_hash: bool = False) -> Iterator[TakeoutRec
                 "latitude": None,
                 "longitude": None,
                 "people": (),
+                "url": None,
+                "media_key": None,
             }
             if sidecar is not None:
                 try:
