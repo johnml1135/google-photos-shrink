@@ -90,8 +90,14 @@ def main() -> int:
     if journal_path.exists():
         journal = json.loads(journal_path.read_text(encoding="utf-8"))
 
+    # Key on the library identity where we have it: an encode can be renamed
+    # or redone, but a second upload of the same photo is a duplicate forever.
+    done_keys = {e.get("media_key") for e in journal.values() if e.get("media_key")}
     print(f"{len(rows)} encoded file(s) in {args.report}", flush=True)
-    pending = [r for r in rows if r["output"] not in journal]
+    pending = [
+        r for r in rows
+        if r["output"] not in journal and (not r.get("media_key") or r["media_key"] not in done_keys)
+    ]
     print(f"{len(journal)} already uploaded, {len(pending)} to go", flush=True)
     if args.dry_run:
         for row in pending:
@@ -165,6 +171,7 @@ def main() -> int:
         verdict, detail = verify_item(stored or item, output, settings.as_dict())
         journal[str(output)] = {
             "source": row["source"],
+            "media_key": row.get("media_key") or "",
             "output": str(output),
             "output_sha256": local_sha,
             "media_item_id": item["id"],

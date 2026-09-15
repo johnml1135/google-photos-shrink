@@ -22,6 +22,7 @@ from photos_shrink.config import load_config
 
 FIELDS = [
     "source",
+    "media_key",
     "album",
     "taken_timestamp_ms",
     "old_bytes",
@@ -36,13 +37,15 @@ FIELDS = [
 ]
 
 
-def eligible(record: takeout.TakeoutRecord, *, kinds: set[str]) -> str | None:
-    """Return a skip reason, or None when the record may be encoded."""
+def eligible(entry: takeout.MirrorEntry, *, kinds: set[str]) -> str | None:
+    """Return a skip reason, or None when the entry may be encoded."""
 
-    if record.kind not in kinds:
-        return f"not selected ({record.kind})"
-    if record.taken_timestamp_ms is None:
+    if entry.kind not in kinds:
+        return f"not selected ({entry.kind})"
+    if entry.taken_timestamp_ms is None:
         return "no timestamp: would be dated 'today' on upload"
+    if entry.media_key is None:
+        return "no media key: the original could not be identified later"
     return None
 
 
@@ -63,12 +66,13 @@ def main() -> int:
     report_path = args.report or work / "takeout-pilot.csv"
 
     print(f"Scanning {args.root} ...", flush=True)
-    records = [r for r in takeout.scan(args.root) if r.kind in kinds]
-    print(f"  {len(records)} {'video' if args.videos else 'photo'} records", flush=True)
+    # The mirror, not a raw file scan: a photo in three albums is exported three
+    # times, and encoding each copy would upload the same photo three times.
+    records = [e for e in takeout.mirror(args.root) if e.kind in kinds]
+    print(f"  {len(records)} unique {'video' if args.videos else 'photo'} items", flush=True)
 
-    # Largest first: the clearest demonstration of savings, and the items that
-    # actually matter for storage.
-    records.sort(key=lambda r: r.size_bytes, reverse=True)
+    # mirror() already orders largest first, which is both the clearest
+    # demonstration of savings and the items that actually matter for storage.
 
     rows: list[dict] = []
     encoded = 0
@@ -83,11 +87,15 @@ def main() -> int:
         target_dir = work / "out"
         target_dir.mkdir(parents=True, exist_ok=True)
         suffix = ".avif" if record.kind == "photo" else ".mp4"
-        output = target_dir / (record.path.stem + suffix)
+        # Stems collide across a library this size, and a collision would
+        # silently overwrite another item's encode. The media key disambiguates.
+        stamp = (record.media_key or "")[3:15]
+        output = target_dir / f"{record.path.stem}-{stamp}{suffix}"
 
         row = {
             "source": str(record.path),
-            "album": record.album or "",
+            "media_key": record.media_key or "",
+            "album": " | ".join(record.albums),
             "taken_timestamp_ms": record.taken_timestamp_ms or "",
             "old_bytes": record.size_bytes,
             "output": str(output),
