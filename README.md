@@ -178,6 +178,23 @@ A high match rate means the hash join is sound and deletion can be targeted
 precisely. A low rate means Takeout is rewriting bytes, and a weaker join such as
 filename and timestamp is not sufficient grounds to delete anything.
 
+### Encoding a bounded batch offline
+
+```powershell
+uv run python tools/takeout_pilot.py "D:/path/to/Takeout" --limit 10
+```
+
+Selects the largest eligible items, encodes and verifies each one, and writes a
+CSV of real old/new sizes and dimensions. Items without a resolvable timestamp
+are never selected. Like the probe this is entirely offline — it contacts
+nothing, uploads nothing, and deletes nothing — so it is safe to run against a
+partially copied export while the rest is still downloading. Pass `--videos` to
+encode videos instead of photos, and `--work` to place outputs off the system
+drive.
+
+Multi-frame JPEGs (MPO, and motion photos) are refused rather than flattened to
+a single frame; Google's own Storage saver leaves MPF JPEGs uncompressed too.
+
 ### What this route still cannot preserve
 
 Because replacement always creates a new item, face and people groupings, shared
