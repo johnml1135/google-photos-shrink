@@ -15,12 +15,15 @@ Pass --check to verify an existing token instead of authorizing again.
 from __future__ import annotations
 
 import argparse
-import os
 import sys
 from pathlib import Path
 
 from photos_shrink.config import load_config
-from photos_shrink.photos_api import PhotosApiClient, PhotosApiError
+from photos_shrink.photos_api import (
+    PhotosApiClient,
+    PhotosApiError,
+    load_client_credentials,
+)
 
 
 def main() -> int:
@@ -30,19 +33,19 @@ def main() -> int:
     parser.add_argument("--no-browser", action="store_true", help="Print the URL, do not open it")
     args = parser.parse_args()
 
-    client_id = os.environ.get("PHOTOS_API_CLIENT_ID", "")
-    client_secret = os.environ.get("PHOTOS_API_CLIENT_SECRET", "")
-    if not client_id or not client_secret:
+    settings = load_config(args.config)
+    work_dir = Path(settings.run["work_dir"])
+    token_path = work_dir / "api-token.json"
+
+    try:
+        client_id, client_secret = load_client_credentials(work_dir)
+    except PhotosApiError as exc:
         print(
-            "Set PHOTOS_API_CLIENT_ID and PHOTOS_API_CLIENT_SECRET first.\n"
-            "Create them in the Google Cloud Console as an OAuth client of type\n"
-            "'Desktop app', with the Photos Library API enabled. See the README.",
+            f"{exc}\n\nThe wizard walks through creating them in the Google Cloud\n"
+            "Console: bash tools/setup_google_api.sh",
             file=sys.stderr,
         )
         return 2
-
-    settings = load_config(args.config)
-    token_path = Path(settings.run["work_dir"]) / "api-token.json"
 
     api = PhotosApiClient(client_id, client_secret, token_path)
 

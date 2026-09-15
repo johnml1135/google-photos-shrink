@@ -59,6 +59,39 @@ class PhotosApiError(RuntimeError):
     """Raised when the Photos API cannot be used safely."""
 
 
+def load_client_credentials(work_dir: str | os.PathLike[str]) -> tuple[str, str]:
+    """Find the OAuth client id and secret.
+
+    The environment wins so a shell can override, but the setup wizard writes
+    them beside the other private state so ordinary runs need no exported
+    variables at all.
+    """
+
+    client_id = os.environ.get("PHOTOS_API_CLIENT_ID", "").strip()
+    client_secret = os.environ.get("PHOTOS_API_CLIENT_SECRET", "").strip()
+    if client_id and client_secret:
+        return client_id, client_secret
+
+    path = Path(work_dir) / "api-client.env"
+    if path.exists():
+        values: dict[str, str] = {}
+        for line in path.read_text(encoding="utf-8").splitlines():
+            line = line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            key, _, value = line.partition("=")
+            values[key.strip()] = value.strip().strip('"').strip("'")
+        client_id = client_id or values.get("PHOTOS_API_CLIENT_ID", "")
+        client_secret = client_secret or values.get("PHOTOS_API_CLIENT_SECRET", "")
+
+    if not client_id or not client_secret:
+        raise PhotosApiError(
+            "no OAuth client credentials found. Run tools/setup_google_api.sh, "
+            "or set PHOTOS_API_CLIENT_ID and PHOTOS_API_CLIENT_SECRET."
+        )
+    return client_id, client_secret
+
+
 class ReauthorizationRequired(PhotosApiError):
     """Raised when the stored refresh token is no longer accepted."""
 

@@ -11,6 +11,7 @@ from photos_shrink.photos_api import (
     PhotosApiError,
     ReauthorizationRequired,
     content_type,
+    load_client_credentials,
 )
 
 
@@ -219,3 +220,33 @@ class TestReadBack:
         url, kwargs = session.gets[0]
         assert url.endswith("/v1/mediaItems/new-1")
         assert kwargs["headers"]["Authorization"] == "Bearer fresh-access"
+
+
+class TestLoadClientCredentials:
+    def test_environment_wins(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("PHOTOS_API_CLIENT_ID", "env-id")
+        monkeypatch.setenv("PHOTOS_API_CLIENT_SECRET", "env-secret")
+        (tmp_path / "api-client.env").write_text(
+            "PHOTOS_API_CLIENT_ID=file-id\nPHOTOS_API_CLIENT_SECRET=file-secret\n", encoding="utf-8"
+        )
+        assert load_client_credentials(tmp_path) == ("env-id", "env-secret")
+
+    def test_falls_back_to_the_wizard_written_file(self, tmp_path, monkeypatch):
+        monkeypatch.delenv("PHOTOS_API_CLIENT_ID", raising=False)
+        monkeypatch.delenv("PHOTOS_API_CLIENT_SECRET", raising=False)
+        (tmp_path / "api-client.env").write_text(
+            "# written by the setup wizard\n"
+            "PHOTOS_API_CLIENT_ID=file-id.apps.googleusercontent.com\n"
+            "PHOTOS_API_CLIENT_SECRET='file-secret'\n",
+            encoding="utf-8",
+        )
+        assert load_client_credentials(tmp_path) == (
+            "file-id.apps.googleusercontent.com",
+            "file-secret",
+        )
+
+    def test_missing_credentials_point_at_the_wizard(self, tmp_path, monkeypatch):
+        monkeypatch.delenv("PHOTOS_API_CLIENT_ID", raising=False)
+        monkeypatch.delenv("PHOTOS_API_CLIENT_SECRET", raising=False)
+        with pytest.raises(PhotosApiError, match="setup_google_api"):
+            load_client_credentials(tmp_path)

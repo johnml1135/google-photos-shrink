@@ -217,9 +217,23 @@ finishes in a short burst rather than a run lasting hours.
 
 #### One-time setup
 
-In the [Google Cloud Console](https://console.cloud.google.com/): create a
-project, enable the **Photos Library API**, configure the OAuth consent screen,
-and create an OAuth client of type **Desktop app**. Then:
+Google has no API key for your own account: anything reaching personal photos
+needs OAuth consent, so the credentials have to be created once in the Google
+Cloud Console. A wizard walks through every click and checks the result:
+
+```bash
+bash tools/setup_google_api.sh
+```
+
+It creates the project, enables the Photos Library API, publishes the consent
+screen, collects the OAuth client id and secret into
+`.photos-shrink/api-client.env`, runs the consent flow, and verifies the stored
+token before finishing. The project is an empty container — no billing, no code,
+no app review — and you never need to open it again.
+
+To do it by hand instead: create a project, enable the **Photos Library API**,
+publish the OAuth consent screen, create an OAuth client of type **Desktop app**,
+then:
 
 ```powershell
 $env:PHOTOS_API_CLIENT_ID     = "....apps.googleusercontent.com"
@@ -227,10 +241,10 @@ $env:PHOTOS_API_CLIENT_SECRET = "...."
 uv run python tools/api_setup.py
 ```
 
-That opens Google's consent page once and stores a refresh token at
-`.photos-shrink/api-token.json`. Keep it private — it grants upload access to
-your account, and like the cookie file it is ignored by Git. Verify it later
-with `uv run python tools/api_setup.py --check`.
+Either route stores a refresh token at `.photos-shrink/api-token.json`. Keep it
+private — it grants upload access to your account, and like the cookie file it
+is ignored by Git. Verify it later with
+`uv run python tools/api_setup.py --check`.
 
 **Publish the consent screen to "In production."** While it is left in
 "Testing", Google expires refresh tokens after seven days and the client will
