@@ -16,9 +16,11 @@ import collections
 import csv
 import json
 import sys
+from datetime import UTC, datetime
 from pathlib import Path
 
 from photos_shrink import takeout
+from photos_shrink.config import load_config
 
 FIELDS = [
     "media_key",
@@ -38,19 +40,20 @@ FIELDS = [
 ]
 
 
-def iso(timestamp_ms: int | None) -> str:
+def iso_timestamp(timestamp_ms: int | None) -> str:
     if not timestamp_ms:
         return ""
-    from datetime import datetime, timezone
-
-    return datetime.fromtimestamp(timestamp_ms / 1000, tz=timezone.utc).isoformat()
+    return datetime.fromtimestamp(timestamp_ms / 1000, tz=UTC).isoformat()
 
 
 def main() -> int:
     parser = argparse.ArgumentParser(description="Inventory a Takeout export")
     parser.add_argument("root", type=Path)
-    parser.add_argument("--out", type=Path, default=Path("G:/takeout-work/mirror.csv"))
+    parser.add_argument("--out", type=Path, default=None, help="Defaults to <work_dir>/mirror.csv")
+    parser.add_argument("--config", default="shrink.toml")
     args = parser.parse_args()
+
+    out = args.out or Path(load_config(args.config).run["work_dir"]) / "mirror.csv"
 
     print(f"Scanning {args.root} ...", flush=True)
     entries = takeout.mirror(args.root)
@@ -58,8 +61,8 @@ def main() -> int:
         print("No media found.", file=sys.stderr)
         return 1
 
-    args.out.parent.mkdir(parents=True, exist_ok=True)
-    with open(args.out, "w", newline="", encoding="utf-8") as handle:
+    out.parent.mkdir(parents=True, exist_ok=True)
+    with open(out, "w", newline="", encoding="utf-8") as handle:
         writer = csv.DictWriter(handle, fieldnames=FIELDS)
         writer.writeheader()
         for entry in entries:
@@ -69,7 +72,7 @@ def main() -> int:
                     "filename": entry.filename,
                     "kind": entry.kind,
                     "size_bytes": entry.size_bytes,
-                    "captured": iso(entry.taken_timestamp_ms),
+                    "captured": iso_timestamp(entry.taken_timestamp_ms),
                     "albums": " | ".join(entry.albums),
                     "copies": entry.copies,
                     "edited": entry.edited,
@@ -109,7 +112,7 @@ def main() -> int:
         print(f"    no media key (cannot be identified in the library): {no_key:,}", flush=True)
         print(f"    no capture time (would be dated 'today'):           {no_time:,}", flush=True)
 
-    summary = args.out.with_suffix(".summary.json")
+    summary = out.with_suffix(".summary.json")
     summary.write_text(
         json.dumps(
             {

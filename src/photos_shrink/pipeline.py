@@ -33,6 +33,32 @@ def _safe_filename(filename: str, suffix: str | None = None) -> str:
     return name
 
 
+def skip_reason(settings: Any, item: dict[str, Any]) -> str | None:
+    """Return why this item must not be replaced, or None when it may be.
+
+    Module level so every entry point shares one gate. Any path that replaces
+    or trashes an item has to ask this first -- a second implementation would
+    silently drift, and the consequence of drift here is deleting something the
+    configuration said to leave alone.
+    """
+
+    if item.get("skip_reason"):
+        return str(item["skip_reason"])
+    if settings.run.get("photos_only", False) and item.get("kind") != "photo":
+        return "non_photo"
+    if settings.run["skip_shared"]:
+        albums = (item.get("metadata") or {}).get("albums") or []
+        if any(bool(album.get("shared")) for album in albums if isinstance(album, dict)):
+            return "shared_album"
+    if settings.run.get("skip_non_space_consuming", True) and (
+        item.get("space_consuming") is False
+        or (item.get("space_taken_bytes") is not None and int(item["space_taken_bytes"]) <= 0)
+    ):
+        # Replacing an item that consumes no quota spends quota to save none.
+        return "non_space_consuming"
+    return settings.exclusion_reason(item)
+
+
 class Pipeline:
     def __init__(self, settings: Settings, remote: Any, state: Any, media: Any | None = None,
                  progress: Callable[[str], None] | None = None):
@@ -67,20 +93,7 @@ class Pipeline:
         return directory
 
     def _skip_reason(self, item: dict[str, Any]) -> str | None:
-        if item.get("skip_reason"):
-            return str(item["skip_reason"])
-        if self.settings.run.get("photos_only", False) and item.get("kind") != "photo":
-            return "non_photo"
-        if self.settings.run["skip_shared"]:
-            albums = (item.get("metadata") or {}).get("albums") or []
-            if any(bool(album.get("shared")) for album in albums if isinstance(album, dict)):
-                return "shared_album"
-        if self.settings.run.get("skip_non_space_consuming", True) and (
-            item.get("space_consuming") is False or
-            (item.get("space_taken_bytes") is not None and int(item["space_taken_bytes"]) <= 0)
-        ):
-            return "non_space_consuming"
-        return self.settings.exclusion_reason(item)
+        return skip_reason(self.settings, item)
 
     def _is_output(self, item_id: str) -> bool:
         return str(item_id) in self._output_ids

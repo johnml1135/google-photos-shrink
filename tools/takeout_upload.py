@@ -60,7 +60,7 @@ def verify_item(item: dict, source: Path, settings: dict) -> tuple[str, str]:
 
 def main() -> int:
     parser = argparse.ArgumentParser(description="Upload encoded replacements via the Photos API")
-    parser.add_argument("--report", type=Path, default=Path("G:/takeout-work/encoded.csv"))
+    parser.add_argument("--report", type=Path, default=None, help="Defaults to <work_dir>/encoded.csv")
     parser.add_argument("--config", default="shrink.toml")
     parser.add_argument("--limit", type=int, default=0, help="0 uploads every encoded row")
     parser.add_argument("--album", default=None, help="Create/use an album for the replacements")
@@ -74,11 +74,16 @@ def main() -> int:
     )
     args = parser.parse_args()
 
+    settings = load_config(args.config)
+    work_dir = Path(settings.run["work_dir"])
+    if args.report is None:
+        args.report = work_dir / "encoded.csv"
     if not args.report.exists():
         print(f"No encode report at {args.report}. Run tools/takeout_encode.py first.", file=sys.stderr)
         return 2
 
-    rows = [r for r in csv.DictReader(open(args.report, encoding="utf-8")) if r["status"] == "encoded"]
+    with open(args.report, encoding="utf-8") as handle:
+        rows = [r for r in csv.DictReader(handle) if r["status"] == "encoded"]
     if args.limit:
         rows = rows[: args.limit]
     if not rows:
@@ -107,8 +112,6 @@ def main() -> int:
         print("Nothing to do.", flush=True)
         return 0
 
-    settings = load_config(args.config)
-    work_dir = Path(settings.run["work_dir"])
     try:
         client_id, client_secret = load_client_credentials(work_dir)
     except PhotosApiError as exc:

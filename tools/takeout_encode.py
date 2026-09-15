@@ -43,13 +43,23 @@ FIELDS = [
 FLUSH_EVERY = 25
 
 
-def eligible(entry: takeout.MirrorEntry) -> str | None:
-    """Return a skip reason, or None when the entry may be encoded."""
+def skip_reason(entry: takeout.MirrorEntry, settings) -> str | None:
+    """Return why this entry must not be encoded, or None when it may be.
+
+    Named for what it returns. The configured date and name exclusions apply
+    here exactly as they do to the main pipeline: a library the user asked to
+    leave alone must be left alone on this route too.
+    """
 
     if entry.taken_timestamp_ms is None:
         return "no timestamp: would be dated 'today' on upload"
     if entry.media_key is None:
         return "no media key: the original could not be identified later"
+    excluded = settings.exclusion_reason(
+        {"filename": entry.filename, "timestamp_ms": entry.taken_timestamp_ms}
+    )
+    if excluded:
+        return excluded
     return None
 
 
@@ -74,7 +84,7 @@ def write_report(path: Path, rows: list[dict]) -> None:
     tmp.replace(path)
 
 
-def human(seconds: float) -> str:
+def format_duration(seconds: float) -> str:
     if seconds < 90:
         return f"{seconds:.0f}s"
     if seconds < 5400:
@@ -86,7 +96,7 @@ def main() -> int:
     parser = argparse.ArgumentParser(description="Encode a Takeout export, resumably")
     parser.add_argument("root", type=Path, help="Extracted Takeout root")
     parser.add_argument("--limit", type=int, default=0, help="0 encodes everything")
-    parser.add_argument("--work", type=Path, default=Path("G:/takeout-work"))
+    parser.add_argument("--work", type=Path, default=None, help="Defaults to run.work_dir")
     parser.add_argument("--config", default="shrink.toml")
     parser.add_argument(
         "--kinds",
@@ -98,8 +108,10 @@ def main() -> int:
     parser.add_argument("--no-resume", action="store_true", help="Re-encode even if output exists")
     args = parser.parse_args()
 
-    settings = load_config(args.config).as_dict()
-    work = args.work
+    config = load_config(args.config)
+    settings = config.as_dict()
+    minimum_savings = float(config.run.get("minimum_savings_percent", 0))
+    work = args.work or Path(config.run["work_dir"])
     target_dir = work / "out"
     target_dir.mkdir(parents=True, exist_ok=True)
     report_path = args.report or work / "encoded.csv"
@@ -123,7 +135,7 @@ def main() -> int:
         if args.limit and (encoded + reused) >= args.limit:
             break
 
-        reason = eligible(entry)
+        reason = skip_reason(entry, config)
         row = {
             "source": str(entry.path),
             "media_key": entry.media_key or "",
@@ -164,6 +176,18 @@ def main() -> int:
         new_bytes = output.stat().st_size
         saved = entry.size_bytes - new_bytes
         percent = 100 * saved / entry.size_bytes if entry.size_bytes else 0.0
+        if percent < minimum_savings:
+            # Uploading this would spend quota to save little or nothing.
+            row.update(
+                status="skipped",
+                reason=f"insufficient savings: {percent:.1f}% < {minimum_savings}%",
+                new_bytes=new_bytes,
+                saved_bytes=saved,
+                saved_percent=round(percent, 2),
+            )
+            rows.append(row)
+            skipped += 1
+            continue
         row.update(
             new_bytes=new_bytes,
             saved_bytes=saved,
@@ -189,7 +213,7 @@ def main() -> int:
                 f"  [{done:,}/{len(entries):,}] {entry.kind} "
                 f"{total_old / 1e9:.2f} GB -> {total_new / 1e9:.2f} GB "
                 f"({100 * (total_old - total_new) / max(1, total_old):.1f}% saved) "
-                f"~{human(remaining)} left",
+                f"~{format_duration(remaining)} left",
                 flush=True,
             )
         if len(rows) % FLUSH_EVERY == 0:
@@ -201,7 +225,7 @@ def main() -> int:
         saved = total_old - total_new
         print(f"  {total_old / 1e9:.2f} GB -> {total_new / 1e9:.2f} GB", flush=True)
         print(f"  saved {saved / 1e9:.2f} GB ({100 * saved / total_old:.1f}%)", flush=True)
-    print(f"  elapsed {human(time.time() - started)}", flush=True)
+    print(f"  elapsed {format_duration(time.time() - started)}", flush=True)
     print(f"  report: {report_path}", flush=True)
     print("  Nothing was uploaded or deleted.", flush=True)
     return 0

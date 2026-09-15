@@ -10,7 +10,6 @@ so a wrong guess yields "no sidecar" rather than another item's timestamps.
 
 from __future__ import annotations
 
-import hashlib
 import json
 import os
 import re
@@ -18,6 +17,8 @@ from collections.abc import Iterator
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
+
+from .integrity import sha256_file
 
 SUPPLEMENTAL = "supplemental-metadata"
 EDITED = "-edited"
@@ -217,12 +218,10 @@ def parse_sidecar(path: str | Path) -> dict[str, Any]:
     }
 
 
-def sha256(path: str | Path, chunk_size: int = 1 << 20) -> str:
-    digest = hashlib.sha256()
-    with open(path, "rb") as handle:
-        for chunk in iter(lambda: handle.read(chunk_size), b""):
-            digest.update(chunk)
-    return digest.hexdigest()
+def sha256(path: str | Path) -> str:
+    """Hash a file through the repo's single hashing seam."""
+
+    return sha256_file(Path(path))
 
 
 def _album_name(directory: Path, root: Path) -> str | None:
