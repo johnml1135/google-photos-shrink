@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import re
 from collections.abc import Iterator
 from dataclasses import dataclass
@@ -291,3 +292,93 @@ def scan(root: str | Path, *, compute_hash: bool = False) -> Iterator[TakeoutRec
                 sha256=sha256(path) if compute_hash else None,
                 **fields,
             )
+
+
+@dataclass(frozen=True)
+class MirrorEntry:
+    """One library item, gathered from every copy of it in the export.
+
+    Takeout writes a photo once per album it belongs to *and* once under its
+    date bucket, so the same library item appears several times. Grouping by
+    media key recovers one entry per item and collects its album membership.
+    """
+
+    media_key: str | None
+    path: Path
+    kind: str
+    size_bytes: int
+    filename: str
+    albums: tuple[str, ...]
+    copies: int
+    url: str | None = None
+    taken_timestamp_ms: int | None = None
+    latitude: float | None = None
+    longitude: float | None = None
+    edited: bool = False
+    has_sidecar: bool = False
+
+    @property
+    def uploadable(self) -> bool:
+        """Whether this item can be replaced without losing its place in time."""
+
+        return self.taken_timestamp_ms is not None and self.media_key is not None
+
+
+def mirror(root: str | os.PathLike[str]) -> list[MirrorEntry]:
+    """Build one entry per library item from a whole export.
+
+    Items without a media key cannot be grouped, so each copy is kept separate
+    rather than merged on a guess.
+    """
+
+    grouped: dict[str, list[TakeoutRecord]] = {}
+    orphans: list[TakeoutRecord] = []
+    for record in scan(root):
+        if record.media_key:
+            grouped.setdefault(record.media_key, []).append(record)
+        else:
+            orphans.append(record)
+
+    entries: list[MirrorEntry] = []
+    for key, records in grouped.items():
+        # Prefer a copy carrying a sidecar, and the largest of those, so the
+        # canonical path is the one with real metadata behind it.
+        best = max(records, key=lambda r: (r.sidecar is not None, r.size_bytes))
+        albums = sorted({r.album for r in records if r.album})
+        entries.append(
+            MirrorEntry(
+                media_key=key,
+                path=best.path,
+                kind=best.kind,
+                size_bytes=best.size_bytes,
+                filename=best.title or best.path.name,
+                albums=tuple(albums),
+                copies=len(records),
+                url=best.url,
+                taken_timestamp_ms=best.taken_timestamp_ms,
+                latitude=best.latitude,
+                longitude=best.longitude,
+                edited=best.edited,
+                has_sidecar=best.sidecar is not None,
+            )
+        )
+    for record in orphans:
+        entries.append(
+            MirrorEntry(
+                media_key=None,
+                path=record.path,
+                kind=record.kind,
+                size_bytes=record.size_bytes,
+                filename=record.title or record.path.name,
+                albums=(record.album,) if record.album else (),
+                copies=1,
+                url=None,
+                taken_timestamp_ms=record.taken_timestamp_ms,
+                latitude=record.latitude,
+                longitude=record.longitude,
+                edited=record.edited,
+                has_sidecar=record.sidecar is not None,
+            )
+        )
+    entries.sort(key=lambda e: e.size_bytes, reverse=True)
+    return entries

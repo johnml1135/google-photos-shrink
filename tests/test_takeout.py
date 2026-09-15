@@ -204,3 +204,56 @@ class TestGooglePhotosLink:
         write(tmp_path / "IMG_0001.jpg.json", payload)
         record = list(takeout.scan(tmp_path))[0]
         assert record.media_key == "AF1QipABC"
+
+
+class TestMirror:
+    def link(self, key):
+        return f"https://photos.google.com/photo/{key}"
+
+    def place(self, tmp_path, folder, name, key, *, album_title=None, body=b"x"):
+        directory = tmp_path / folder
+        directory.mkdir(parents=True, exist_ok=True)
+        (directory / name).write_bytes(body)
+        payload = sidecar_payload(title=name)
+        payload["url"] = self.link(key)
+        write(directory / f"{name}.supplemental-metadata.json", payload)
+        if album_title:
+            write(directory / "metadata.json", {"title": album_title})
+
+    def test_one_entry_per_item_with_albums_collected(self, tmp_path):
+        self.place(tmp_path, "Photos from 2024", "IMG_1.jpg", "KEY1")
+        self.place(tmp_path, "Wedding", "IMG_1.jpg", "KEY1", album_title="Wedding")
+        self.place(tmp_path, "Favourites", "IMG_1.jpg", "KEY1", album_title="Favourites")
+
+        entries = takeout.mirror(tmp_path)
+        assert len(entries) == 1, "the same library item must not be counted three times"
+        entry = entries[0]
+        assert entry.media_key == "KEY1"
+        assert entry.albums == ("Favourites", "Wedding")
+        assert entry.copies == 3
+
+    def test_distinct_items_stay_distinct(self, tmp_path):
+        self.place(tmp_path, "Photos from 2024", "IMG_1.jpg", "KEY1")
+        self.place(tmp_path, "Photos from 2024", "IMG_2.jpg", "KEY2")
+        assert {e.media_key for e in takeout.mirror(tmp_path)} == {"KEY1", "KEY2"}
+
+    def test_items_without_a_media_key_are_not_merged(self, tmp_path):
+        directory = tmp_path / "Photos from 2024"
+        directory.mkdir(parents=True)
+        for name in ("A.jpg", "B.jpg"):
+            (directory / name).write_bytes(b"x")
+        entries = takeout.mirror(tmp_path)
+        assert len(entries) == 2
+        assert all(e.media_key is None for e in entries)
+
+    def test_entries_are_ordered_largest_first(self, tmp_path):
+        self.place(tmp_path, "Photos from 2024", "small.jpg", "K1", body=b"x")
+        self.place(tmp_path, "Photos from 2024", "big.jpg", "K2", body=b"x" * 500)
+        assert [e.filename for e in takeout.mirror(tmp_path)] == ["big.jpg", "small.jpg"]
+
+    def test_uploadable_requires_a_timestamp_and_identity(self, tmp_path):
+        self.place(tmp_path, "Photos from 2024", "IMG_1.jpg", "KEY1")
+        (tmp_path / "Photos from 2024" / "nosidecar.jpg").write_bytes(b"x")
+        entries = {e.filename: e for e in takeout.mirror(tmp_path)}
+        assert entries["IMG_1.jpg"].uploadable
+        assert not entries["nosidecar.jpg"].uploadable
