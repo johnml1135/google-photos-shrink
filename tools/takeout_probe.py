@@ -51,21 +51,42 @@ def summarize(records: list[takeout.TakeoutRecord]) -> dict:
     }
 
 
-def sample(records: list[takeout.TakeoutRecord], count: int, seed: int = 0) -> list[takeout.TakeoutRecord]:
-    """Pick a spread across kind / edited / sidecar-presence, not just the first N."""
+def bucket_of(record: takeout.TakeoutRecord) -> str:
+    """Group records by the traits that plausibly affect whether bytes match."""
 
-    buckets: dict[tuple, list] = collections.defaultdict(list)
-    for record in records:
-        buckets[(record.kind, record.edited, record.sidecar is not None)].append(record)
+    if record.edited:
+        return f"{record.kind}/edited"
+    if "(" in record.path.stem:
+        return f"{record.kind}/duplicate-counter"
+    return f"{record.kind}/plain"
+
+
+def sample(
+    records: list[takeout.TakeoutRecord],
+    count: int,
+    *,
+    stratified: bool = False,
+    seed: int = 0,
+) -> list[takeout.TakeoutRecord]:
+    """Pick files to hash-match.
+
+    The default is a uniform random draw, because an equal draw from each
+    bucket over-represents rare categories -- edited variants, duplicate
+    counters, videos -- and a rate computed from it is not the library's rate.
+    Use stratified only to probe coverage of the odd categories deliberately.
+    """
 
     rng = random.Random(seed)
+    if not stratified:
+        return rng.sample(records, min(count, len(records)))
+
+    buckets: dict[str, list] = collections.defaultdict(list)
+    for record in records:
+        buckets[bucket_of(record)].append(record)
     chosen: list[takeout.TakeoutRecord] = []
     per_bucket = max(1, count // max(1, len(buckets)))
     for bucket in buckets.values():
         chosen.extend(rng.sample(bucket, min(per_bucket, len(bucket))))
-    remaining = [r for r in records if r not in chosen]
-    if len(chosen) < count and remaining:
-        chosen.extend(rng.sample(remaining, min(count - len(chosen), len(remaining))))
     return chosen[:count]
 
 
@@ -76,6 +97,12 @@ def main() -> int:
     parser.add_argument("--config", default="shrink.toml")
     parser.add_argument("--report", type=Path, default=Path(".photos-shrink/takeout-probe.json"))
     parser.add_argument("--offline", action="store_true", help="Inventory only; do not contact Google")
+    parser.add_argument(
+        "--stratified",
+        action="store_true",
+        help="Draw evenly from each category instead of uniformly. Probes odd "
+        "categories deliberately; the resulting rate is NOT the library's rate.",
+    )
     args = parser.parse_args()
 
     print(f"Scanning {args.root} ...", flush=True)
@@ -98,7 +125,7 @@ def main() -> int:
     report = {"root": str(args.root), "inventory": stats, "matches": []}
 
     if not args.offline:
-        chosen = sample(records, args.sample)
+        chosen = sample(records, args.sample, stratified=args.stratified)
         print(f"\n--- Hash-matching {len(chosen)} sampled files against the library ---", flush=True)
         remote = GooglePhotosRemote(load_config(args.config).as_dict())
         try:
@@ -119,6 +146,7 @@ def main() -> int:
                         "file": str(record.path),
                         "kind": record.kind,
                         "edited": record.edited,
+                        "bucket": bucket_of(record),
                         "result": "match" if match else "miss",
                         "item_id": (match or {}).get("id"),
                     }
@@ -126,6 +154,24 @@ def main() -> int:
             attempted = len([m for m in report["matches"] if m["result"] in {"match", "miss"}])
             rate = 100 * hits / attempted if attempted else 0.0
             report["hit_rate_percent"] = round(rate, 1)
+
+            # Break the rate down: a category that never matches is a finding,
+            # and an aggregate can hide it entirely.
+            per_bucket: dict[str, list[int]] = collections.defaultdict(lambda: [0, 0])
+            for entry in report["matches"]:
+                if entry["result"] not in {"match", "miss"}:
+                    continue
+                slot = per_bucket[entry["bucket"]]
+                slot[0] += entry["result"] == "match"
+                slot[1] += 1
+            report["by_bucket"] = {k: {"match": v[0], "of": v[1]} for k, v in per_bucket.items()}
+            print("\n  By category:", flush=True)
+            for name, (matched, total) in sorted(per_bucket.items()):
+                print(f"    {name:<28} {matched}/{total}", flush=True)
+
+            errors = len([m for m in report["matches"] if m["result"] == "error"])
+            if errors:
+                print(f"\n  {errors} request(s) errored -- rate below excludes them.", flush=True)
             print(f"\n  Hash match rate: {hits}/{attempted} ({rate:.1f}%)", flush=True)
             if rate >= 90:
                 print("  => Takeout bytes match the library. The hash join is sound.", flush=True)

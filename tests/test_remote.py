@@ -14,7 +14,11 @@ from photos_shrink.auth import (
     UploadNotStartedError,
     load_netscape_cookies,
 )
-from photos_shrink.remote import GooglePhotosRemote, RemoteProtocolError
+from photos_shrink.remote import (
+    GooglePhotosRemote,
+    RemoteProtocolError,
+    SessionRefreshError,
+)
 
 
 @dataclass
@@ -1125,3 +1129,66 @@ def test_restore_metadata_selects_shared_and_regular_album_payloads(tmp_path):
         Payloads.AddItemsToExistingSharedAlbum,
         Payloads.AddItemsToExistingAlbum,
     ]
+
+
+def test_periodic_refresh_failure_does_not_abort_a_working_session(tmp_path, monkeypatch):
+    """A timed refresh is opportunistic: losing it must not kill a healthy run."""
+
+    client = Client()
+    remote = GooglePhotosRemote(
+        {**settings(tmp_path), "google": {**settings(tmp_path)["google"], "session_refresh_seconds": 10}},
+        client=client,
+        payloads=Payloads,
+    )
+    remote._last_refresh_monotonic = 0
+    monkeypatch.setattr("photos_shrink.remote.time.monotonic", lambda: 100.0)
+
+    def failing_refresh():
+        raise SessionRefreshError("browser profile is not authenticated")
+
+    monkeypatch.setattr(remote, "refresh_session", failing_refresh)
+    client.responses[GetItemInfo] = type("R", (), {"success": True, "data": object()})()
+
+    assert remote._execute(GetItemInfo()) is not None
+
+
+def test_periodic_refresh_failure_backs_off_instead_of_retrying_every_request(tmp_path, monkeypatch):
+    client = Client()
+    remote = GooglePhotosRemote(
+        {**settings(tmp_path), "google": {**settings(tmp_path)["google"], "session_refresh_seconds": 10}},
+        client=client,
+        payloads=Payloads,
+    )
+    remote._last_refresh_monotonic = 0
+    monkeypatch.setattr("photos_shrink.remote.time.monotonic", lambda: 100.0)
+    attempts = []
+
+    def failing_refresh():
+        attempts.append(True)
+        raise SessionRefreshError("browser profile is not authenticated")
+
+    monkeypatch.setattr(remote, "refresh_session", failing_refresh)
+    client.responses[GetItemInfo] = type("R", (), {"success": True, "data": object()})()
+
+    remote._execute(GetItemInfo())
+    remote._execute(GetItemInfo())
+    assert len(attempts) == 1, "a failed timed refresh must not be retried on every request"
+
+
+def test_failed_retry_refresh_reports_the_original_read_failure(tmp_path, monkeypatch):
+    """Diagnostics must name the request that failed, not the refresh."""
+
+    client = Client()
+    remote = GooglePhotosRemote(settings(tmp_path), client=client, payloads=Payloads)
+
+    def send(payload):
+        raise RuntimeError("temporary")
+
+    client.send_api_request = send
+
+    def failing_refresh():
+        raise SessionRefreshError("browser profile is not authenticated")
+
+    monkeypatch.setattr(remote, "refresh_session", failing_refresh)
+    with pytest.raises(RemoteProtocolError, match="refresh-read"):
+        remote._execute(GetItemInfo())

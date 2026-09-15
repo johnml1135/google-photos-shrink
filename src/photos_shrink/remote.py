@@ -316,7 +316,17 @@ class GooglePhotosRemote:
             return
         if not self._refresh_due():
             return
-        self.refresh_session()
+        try:
+            self.refresh_session()
+        except SessionRefreshError:
+            # A timed refresh is opportunistic. The browser profile can be
+            # signed out while the HTTP session is still perfectly good, and
+            # discarding that session would abandon a working run. The jar is
+            # already rolled back, so carry on: if the session really is dead
+            # the next request fails on its own merits, naming the real
+            # operation. Back off so one stale profile does not re-attempt a
+            # browser round trip before every subsequent request.
+            self._last_refresh_monotonic = time.monotonic()
 
     def _refresh_due(self) -> bool:
         return (
@@ -370,13 +380,16 @@ class GooglePhotosRemote:
         self._maybe_refresh()
         try:
             return self._request(payload)
-        except RemoteProtocolError:
+        except RemoteProtocolError as original:
             if not self._is_read_only(payload) or self._upload_in_progress or self._session_refresh_seconds <= 0:
                 raise
             try:
                 self.refresh_session()
-            except SessionRefreshError:
-                raise
+            except SessionRefreshError as exc:
+                # Report what actually failed. The refresh was an attempted
+                # recovery, not the operation the caller asked for, and naming
+                # it instead hides which request went wrong.
+                raise original from exc
             return self._request(payload)
 
     def _bound_session_timeout(self) -> None:
