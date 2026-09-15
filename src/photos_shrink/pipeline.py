@@ -16,6 +16,8 @@ from typing import Any
 from .auth import UploadNotStartedError
 from .config import Settings
 from .integrity import sha256_file as _hash
+from .policy import Candidate, verdict
+from .replacement import check_identity
 
 
 class PipelineError(RuntimeError):
@@ -40,23 +42,16 @@ def skip_reason(settings: Any, item: dict[str, Any]) -> str | None:
     or trashes an item has to ask this first -- a second implementation would
     silently drift, and the consequence of drift here is deleting something the
     configuration said to leave alone.
+
+    Delegates to `photos_shrink.policy.verdict`, the one place this decision is
+    made. The `item["skip_reason"]` passthrough stays here: it is a remote-
+    computed verdict (unsupported media, no download URL, ...) that has no
+    equivalent on the Takeout mirror side and so is not part of `Candidate`.
     """
 
     if item.get("skip_reason"):
         return str(item["skip_reason"])
-    if settings.run.get("photos_only", False) and item.get("kind") != "photo":
-        return "non_photo"
-    if settings.run["skip_shared"]:
-        albums = (item.get("metadata") or {}).get("albums") or []
-        if any(bool(album.get("shared")) for album in albums if isinstance(album, dict)):
-            return "shared_album"
-    if settings.run.get("skip_non_space_consuming", True) and (
-        item.get("space_consuming") is False
-        or (item.get("space_taken_bytes") is not None and int(item["space_taken_bytes"]) <= 0)
-    ):
-        # Replacing an item that consumes no quota spends quota to save none.
-        return "non_space_consuming"
-    return settings.exclusion_reason(item)
+    return verdict(settings, Candidate.from_library_item(item))
 
 
 class Pipeline:
@@ -117,7 +112,7 @@ class Pipeline:
         replacement_id = found.get("id")
         if not replacement_id:
             raise PipelineError("reconciled upload did not contain an item id")
-        self._check_identity(plan["item"], found)
+        check_identity(plan["item"], found, error=PipelineError)
         self._output_ids.add(str(replacement_id))
 
     def _download_backup(self, item: dict[str, Any], directory: Path) -> tuple[Path, str]:
@@ -327,7 +322,7 @@ class Pipeline:
                       restore_metadata: bool) -> bool:
         item = plan["item"]
         item_id = str(item["id"])
-        self._check_identity(item, replacement)
+        check_identity(item, replacement, error=PipelineError)
         if restore_metadata:
             self.remote.restore_metadata(item, replacement)
         self.remote.verify_replacement(item, replacement, output_info)
@@ -350,7 +345,7 @@ class Pipeline:
         self._verify_backup(plan, row)
         if row.get("stage") in {"trash_ready", "uploaded"}:
             replacement = self.remote.get_item(row["replacement_id"]) if hasattr(self.remote, "get_item") else {"id": row["replacement_id"]}
-            self._check_identity(item, replacement)
+            check_identity(item, replacement, error=PipelineError)
             output_info = self._local_output_info(plan, row)
             plan["output_info"] = output_info
             return self._finalize_one(
@@ -368,7 +363,7 @@ class Pipeline:
             replacement_id = replacement.get("id")
             if not replacement_id:
                 raise PipelineError("upload response did not contain an item id")
-            self._check_identity(item, replacement)
+            check_identity(item, replacement, error=PipelineError)
             self.state.mark_uploaded(item_id, replacement_id, row["output_hash"])
             register_replacements = getattr(self.remote, "register_replacements", None)
             if callable(register_replacements):
@@ -409,10 +404,10 @@ class Pipeline:
             replacement_id = replacement.get("id")
             if not replacement_id:
                 raise PipelineError("upload response did not contain an item id")
-            self._check_identity(item, replacement)
+            check_identity(item, replacement, error=PipelineError)
             self.state.mark_uploaded(item_id, replacement_id, output_hash)
         replacement = self.remote.get_item(replacement_id) if hasattr(self.remote, "get_item") else replacement
-        self._check_identity(item, replacement)
+        check_identity(item, replacement, error=PipelineError)
         output_info = self._local_output_info(plan, self.state.get_item(item_id) or {})
         output_info.update({key: value for key, value in (plan.get("output_info") or {}).items()
                             if key not in {"output_sha256", "output_path", "size_bytes"}})
@@ -421,13 +416,6 @@ class Pipeline:
             plan, replacement, output_info, keep_originals=keep_originals,
             restore_metadata=True,
         )
-
-    @staticmethod
-    def _check_identity(original: dict[str, Any], replacement: dict[str, Any]) -> None:
-        if not replacement or str(replacement.get("id")) == str(original.get("id")):
-            raise PipelineError("replacement identity is not distinct from original")
-        if original.get("dedup_key") and replacement.get("dedup_key") == original.get("dedup_key"):
-            raise PipelineError("replacement has the original deduplication identity")
 
     def run(self, *, plan_only: bool = False, yes: bool = False, confirm: Callable[[Path], bool] | None = None,
             report_path: str | Path | None = None, keep_originals: bool = False) -> dict[str, Any]:

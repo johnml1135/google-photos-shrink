@@ -19,10 +19,12 @@ import argparse
 import csv
 import sys
 import time
+from dataclasses import replace
 from pathlib import Path
 
 from photos_shrink import media, takeout
 from photos_shrink.config import load_config
+from photos_shrink.policy import Candidate, explain, verdict
 
 FIELDS = [
     "source",
@@ -41,26 +43,6 @@ FIELDS = [
 ]
 
 FLUSH_EVERY = 25
-
-
-def skip_reason(entry: takeout.MirrorEntry, settings) -> str | None:
-    """Return why this entry must not be encoded, or None when it may be.
-
-    Named for what it returns. The configured date and name exclusions apply
-    here exactly as they do to the main pipeline: a library the user asked to
-    leave alone must be left alone on this route too.
-    """
-
-    if entry.taken_timestamp_ms is None:
-        return "no timestamp: would be dated 'today' on upload"
-    if entry.media_key is None:
-        return "no media key: the original could not be identified later"
-    excluded = settings.exclusion_reason(
-        {"filename": entry.filename, "timestamp_ms": entry.taken_timestamp_ms}
-    )
-    if excluded:
-        return excluded
-    return None
 
 
 def output_path(entry: takeout.MirrorEntry, target_dir: Path) -> Path:
@@ -135,7 +117,8 @@ def main() -> int:
         if args.limit and (encoded + reused) >= args.limit:
             break
 
-        reason = skip_reason(entry, config)
+        candidate = Candidate.from_mirror_entry(entry)
+        token = verdict(config, candidate)
         row = {
             "source": str(entry.path),
             "media_key": entry.media_key or "",
@@ -143,8 +126,8 @@ def main() -> int:
             "taken_timestamp_ms": entry.taken_timestamp_ms or "",
             "old_bytes": entry.size_bytes,
         }
-        if reason:
-            row.update(status="skipped", reason=reason, output="")
+        if token:
+            row.update(status="skipped", reason=explain(token), output="")
             rows.append(row)
             skipped += 1
             continue
@@ -176,11 +159,12 @@ def main() -> int:
         new_bytes = output.stat().st_size
         saved = entry.size_bytes - new_bytes
         percent = 100 * saved / entry.size_bytes if entry.size_bytes else 0.0
-        if percent < minimum_savings:
+        encoded_token = verdict(config, replace(candidate, saved_percent=percent))
+        if encoded_token:
             # Uploading this would spend quota to save little or nothing.
             row.update(
                 status="skipped",
-                reason=f"insufficient savings: {percent:.1f}% < {minimum_savings}%",
+                reason=explain(encoded_token, percent=percent, minimum=minimum_savings),
                 new_bytes=new_bytes,
                 saved_bytes=saved,
                 saved_percent=round(percent, 2),

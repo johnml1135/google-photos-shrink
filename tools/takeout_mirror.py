@@ -127,7 +127,7 @@ def main() -> int:
         ),
         encoding="utf-8",
     )
-    print(f"\n  mirror : {args.out}", flush=True)
+    print(f"\n  mirror : {out}", flush=True)
     print(f"  summary: {summary}", flush=True)
     return 0
 

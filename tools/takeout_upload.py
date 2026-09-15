@@ -13,13 +13,13 @@ from __future__ import annotations
 
 import argparse
 import csv
-import json
 import sys
 import time
 from pathlib import Path
 
 from photos_shrink import media, takeout
 from photos_shrink.config import load_config
+from photos_shrink.ledger import UploadJournal, UploadRecord
 from photos_shrink.photos_api import (
     PhotosApiClient,
     PhotosApiError,
@@ -91,13 +91,9 @@ def main() -> int:
         return 1
 
     journal_path = args.journal or args.report.with_name("takeout-upload-journal.json")
-    journal: dict[str, dict] = {}
-    if journal_path.exists():
-        journal = json.loads(journal_path.read_text(encoding="utf-8"))
+    journal = UploadJournal.load(journal_path)
 
-    # Key on the library identity where we have it: an encode can be renamed
-    # or redone, but a second upload of the same photo is a duplicate forever.
-    done_keys = {e.get("media_key") for e in journal.values() if e.get("media_key")}
+    done_keys = journal.already_uploaded_keys()
     print(f"{len(rows)} encoded file(s) in {args.report}", flush=True)
     pending = [
         r for r in rows
@@ -127,18 +123,18 @@ def main() -> int:
     print("API credentials verified.", flush=True)
 
     if args.reverify:
-        for key, entry in journal.items():
+        for record in journal.all_records():
             try:
-                stored = api.get_media_item(entry["media_item_id"])
+                stored = api.get_media_item(record.media_item_id)
             except PhotosApiError as exc:
-                entry["verified"], entry["verified_detail"] = "unverified", str(exc)
+                record.verified, record.verified_detail = "unverified", str(exc)
                 continue
-            verdict, detail = verify_item(stored, Path(entry["output"]), settings.as_dict())
-            entry["verified"], entry["verified_detail"] = verdict, detail
-            entry["capture_time"] = (stored.get("mediaMetadata") or {}).get("creationTime")
-            print(f"  {Path(entry['output']).name}: {verdict}  {detail}", flush=True)
-        journal_path.write_text(json.dumps(journal, indent=2), encoding="utf-8")
-        ok = sum(1 for e in journal.values() if e.get("verified") == "ok")
+            verdict, detail = verify_item(stored, record.output, settings.as_dict())
+            record.verified, record.verified_detail = verdict, detail
+            record.capture_time = (stored.get("mediaMetadata") or {}).get("creationTime")
+            print(f"  {record.output.name}: {verdict}  {detail}", flush=True)
+        journal.save()
+        ok = sum(1 for r in journal.all_records() if r.verified == "ok")
         print(f"\n  verified {ok}/{len(journal)}; nothing was uploaded.", flush=True)
         return 0
 
@@ -172,20 +168,19 @@ def main() -> int:
             print(f"      read-back failed: {exc}", flush=True)
 
         verdict, detail = verify_item(stored or item, output, settings.as_dict())
-        journal[str(output)] = {
-            "source": row["source"],
-            "media_key": row.get("media_key") or "",
-            "output": str(output),
-            "output_sha256": local_sha,
-            "media_item_id": item["id"],
-            "filename": (stored or item).get("filename"),
-            "mime_type": (stored or item).get("mimeType"),
-            "verified": verdict,
-            "verified_detail": detail,
-            "capture_time": ((stored or item).get("mediaMetadata") or {}).get("creationTime"),
-            "uploaded_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
-        }
-        journal_path.write_text(json.dumps(journal, indent=2), encoding="utf-8")
+        journal.record(UploadRecord(
+            source=Path(row["source"]),
+            media_key=row.get("media_key") or "",
+            output=output,
+            output_sha256=local_sha,
+            media_item_id=item["id"],
+            filename=(stored or item).get("filename"),
+            mime_type=(stored or item).get("mimeType"),
+            verified=verdict,
+            verified_detail=detail,
+            capture_time=((stored or item).get("mediaMetadata") or {}).get("creationTime"),
+            uploaded_at=time.strftime("%Y-%m-%dT%H:%M:%S"),
+        ))
 
         uploaded += 1
         print(
@@ -196,9 +191,9 @@ def main() -> int:
             time.sleep(args.pause)
 
     print(f"\n--- uploaded {uploaded}, failed {failed} ---", flush=True)
-    ok = sum(1 for e in journal.values() if e.get("verified") == "ok")
-    bad = [e for e in journal.values() if e.get("verified") == "mismatch"]
-    unverified = [e for e in journal.values() if e.get("verified") == "unverified"]
+    ok = sum(1 for r in journal.all_records() if r.verified == "ok")
+    bad = [r for r in journal.all_records() if r.verified == "mismatch"]
+    unverified = [r for r in journal.all_records() if r.verified == "unverified"]
     print(f"  verified (name, dimensions, capture time): {ok}/{len(journal)}", flush=True)
     note = "  Note: the API cannot confirm stored bytes; it re-renders AVIF to JPEG on download."
     print(note, flush=True)
@@ -206,8 +201,8 @@ def main() -> int:
         print(f"  {len(unverified)} item(s) could not be checked.", flush=True)
     if bad:
         print(f"  WARNING: {len(bad)} item(s) do not match what was uploaded:", flush=True)
-        for entry in bad:
-            print(f"    {entry['filename']}: {entry['verified_detail']}", flush=True)
+        for record in bad:
+            print(f"    {record.filename}: {record.verified_detail}", flush=True)
         print("  Do NOT delete the originals for those.", flush=True)
     print(f"  journal: {journal_path}", flush=True)
     print("  No originals were deleted.", flush=True)
