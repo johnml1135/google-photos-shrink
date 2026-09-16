@@ -751,6 +751,51 @@ def test_photo_replacement_verification_does_not_require_video_duration(tmp_path
     )
 
 
+class TestReplacementAlbums:
+    """The replacement must be in every album the original is in; extras are allowed unless shared."""
+
+    A = {"id": "a", "title": "Trip", "shared": False}
+    BATCH = {"id": "batch", "title": "photos-shrink batch 1", "shared": False}
+    SHARED = {"id": "s", "title": "Family", "shared": True}
+
+    def _verify(self, tmp_path, original_albums, replacement_albums):
+        output = tmp_path / "encoded.jpg"
+        output.write_bytes(b"encoded")
+        sha256 = sha256_file(output)
+        base = {"description": None, "favorite": False, "archived": False, "latitude": None, "longitude": None}
+        original = {"id": "original", "dedup_key": "old", "timestamp_ms": 10, "timezone_offset": 0,
+                    "metadata": {**base, "albums": original_albums}}
+        replacement = {"id": "replacement", "dedup_key": "new", "size_bytes": 7, "width": 100,
+                       "height": 100, "kind": "photo", "sha256": sha256}
+
+        class VerificationRemote(GooglePhotosRemote):
+            def get_item(self, id):
+                return {**replacement, "timestamp_ms": 10, "timezone_offset": 0, "duration_seconds": None,
+                        "metadata": {**base, "albums": replacement_albums}, "skip_reason": None}
+
+            def _verify_remote_bytes(self, item, expected_sha256):
+                pass
+
+        VerificationRemote({"run": {"skip_shared": True}}).verify_replacement(
+            original, replacement,
+            {"size_bytes": 7, "width": 100, "height": 100, "kind": "photo", "sha256": sha256, "path": output},
+        )
+
+    def test_the_uploaders_batch_album_is_allowed_as_an_extra(self, tmp_path):
+        """The live failure: every replacement sits in the batch album its original is not in."""
+
+        self._verify(tmp_path, [], [self.BATCH])
+        self._verify(tmp_path, [self.A], [self.A, self.BATCH])
+
+    def test_a_missing_album_is_refused(self, tmp_path):
+        with pytest.raises(RemoteProtocolError, match="albums do not match"):
+            self._verify(tmp_path, [self.A], [self.BATCH])
+
+    def test_an_extra_shared_album_is_refused(self, tmp_path):
+        with pytest.raises(RemoteProtocolError, match="albums do not match"):
+            self._verify(tmp_path, [], [self.SHARED])
+
+
 def test_remote_byte_verification_rejects_changed_download(tmp_path):
     output = tmp_path / "encoded.jpg"
     output.write_bytes(b"encoded")

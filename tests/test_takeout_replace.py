@@ -1,6 +1,6 @@
 """Tests for the only Takeout code that destroys anything.
 
-`replace_one` holds ten refusal points in a fixed order (see
+`replace_one` holds nine refusal points in a fixed order (see
 `photos_shrink.replacement`'s module docstring). Testing only the pure
 helper functions -- confirm_original, check_identity, output_info_for -- would
 prove each check works in isolation but say nothing about the order they run
@@ -102,6 +102,7 @@ def make_item(item_id: str, **overrides) -> dict[str, Any]:
         "filename": "IMG_1.jpg",
         "kind": "photo",
         "timestamp_ms": 1_700_000_000_000,
+        "size_bytes": len(b"original bytes"),  # matches make_job's source
         "space_taken_bytes": 12345,
         "metadata": {"albums": []},
     }
@@ -130,30 +131,44 @@ def patch_probe(monkeypatch):
 
 
 class TestConfirmOriginal:
-    def test_accepts_when_the_hash_resolves_to_the_claimed_key(self, tmp_path):
-        library = FakeLibrary(by_hash={"IMG_1.jpg": {"id": "KEY1"}})
+    def _source(self, tmp_path):
         source = tmp_path / "IMG_1.jpg"
         source.write_bytes(b"original bytes")
-        assert confirm_original(library, source, "KEY1")["id"] == "KEY1"
+        return source
 
-    def test_refuses_when_the_hash_resolves_to_a_different_item(self, tmp_path):
-        """A sidecar media key is a claim; the content hash is the proof."""
+    def test_accepts_the_sidecar_key_when_id_and_size_agree(self, tmp_path):
+        library = FakeLibrary(items={"KEY1": make_item("KEY1")})
+        assert confirm_original(library, self._source(tmp_path), "KEY1")["id"] == "KEY1"
 
-        library = FakeLibrary(by_hash={"IMG_1.jpg": {"id": "SOMEONE_ELSE"}})
-        source = tmp_path / "IMG_1.jpg"
-        source.write_bytes(b"original bytes")
-        with pytest.raises(ReplaceError, match="sidecar claims"):
-            confirm_original(library, source, "KEY1")
+    def test_never_searches_by_content_hash(self, tmp_path):
+        """The live hash search missed held items and returned the wrong copy of a duplicate."""
 
-    def test_refuses_when_the_bytes_resolve_to_nothing(self, tmp_path):
-        source = tmp_path / "IMG_1.jpg"
-        source.write_bytes(b"original bytes")
-        with pytest.raises(ReplaceError, match="do not resolve"):
-            confirm_original(FakeLibrary(), source, "KEY1")
+        library = FakeLibrary(items={"KEY1": make_item("KEY1")})
+        confirm_original(library, self._source(tmp_path), "KEY1")
+        assert library.names() == ["get_item"]
+
+    def test_refuses_when_the_size_differs(self, tmp_path):
+        """A sidecar paired with the wrong file names an item of another size."""
+
+        library = FakeLibrary(items={"KEY1": make_item("KEY1", size_bytes=999)})
+        with pytest.raises(ReplaceError, match="may describe a different file"):
+            confirm_original(library, self._source(tmp_path), "KEY1")
+
+    def test_refuses_when_the_size_is_unknown(self, tmp_path):
+        library = FakeLibrary(items={"KEY1": make_item("KEY1", size_bytes=None)})
+        with pytest.raises(ReplaceError, match="may describe a different file"):
+            confirm_original(library, self._source(tmp_path), "KEY1")
+
+    def test_refuses_when_get_item_returns_another_id(self, tmp_path):
+        library = FakeLibrary(items={"KEY1": make_item("SOMEONE_ELSE")})
+        with pytest.raises(ReplaceError, match="get_item returned"):
+            confirm_original(library, self._source(tmp_path), "KEY1")
 
     def test_refuses_when_the_exported_original_is_missing(self, tmp_path):
+        library = FakeLibrary(items={"KEY1": make_item("KEY1")})
         with pytest.raises(ReplaceError, match="missing from the export"):
-            confirm_original(FakeLibrary(), tmp_path / "gone.jpg", "KEY1")
+            confirm_original(library, tmp_path / "gone.jpg", "KEY1")
+        assert library.calls == []
 
 
 class TestCheckIdentity:
@@ -206,24 +221,19 @@ class TestReplaceOneOrder:
             replace_one(library, job, settings=settings, ffprobe="ffprobe", apply=True, keep_originals=False)
         assert library.calls == []
 
-    def test_confirm_original_mismatch_stops_before_get_item(self, tmp_path):
-        settings = settings_for(tmp_path)
-        job = make_job(tmp_path, media_key="CLAIMED")
-        library = FakeLibrary(by_hash={"IMG_1.jpg": {"id": "SOMEONE_ELSE"}})
-        with pytest.raises(ReplaceError, match="sidecar claims"):
-            replace_one(library, job, settings=settings, ffprobe="ffprobe", apply=True, keep_originals=False)
-        assert library.names() == ["find_uploaded"]
-
-    def test_get_item_reconciliation_refuses_a_mismatched_full_item(self, tmp_path):
-        """confirm_original's proof must not be silently overwritten by get_item."""
-
+    def test_size_mismatch_stops_before_the_replacement_is_looked_up(self, tmp_path):
         settings = settings_for(tmp_path)
         job = make_job(tmp_path, media_key="KEY1")
-        library = FakeLibrary(
-            by_hash={"IMG_1.jpg": {"id": "KEY1"}},
-            items={"KEY1": make_item("SOMETHING_ELSE")},
-        )
-        with pytest.raises(ReplaceError, match="content hash proved"):
+        library = FakeLibrary(items={"KEY1": make_item("KEY1", size_bytes=999)})
+        with pytest.raises(ReplaceError, match="may describe a different file"):
+            replace_one(library, job, settings=settings, ffprobe="ffprobe", apply=True, keep_originals=False)
+        assert library.names() == ["get_item"]
+
+    def test_a_mismatched_item_id_is_refused(self, tmp_path):
+        settings = settings_for(tmp_path)
+        job = make_job(tmp_path, media_key="KEY1")
+        library = FakeLibrary(items={"KEY1": make_item("SOMETHING_ELSE")})
+        with pytest.raises(ReplaceError, match="get_item returned"):
             replace_one(library, job, settings=settings, ffprobe="ffprobe", apply=True, keep_originals=False)
         assert "restore_metadata" not in library.names()
         assert "trash" not in library.names()
@@ -234,13 +244,12 @@ class TestReplaceOneOrder:
         settings = settings_for(tmp_path, skip_shared=True)
         job = make_job(tmp_path, media_key="KEY1")
         original = make_item("KEY1", metadata={"albums": [{"id": "a", "shared": True}]})
-        library = FakeLibrary(by_hash={"IMG_1.jpg": {"id": "KEY1"}}, items={"KEY1": original})
+        library = FakeLibrary(items={"KEY1": original})
         outcome = replace_one(library, job, settings=settings, ffprobe="ffprobe", apply=True, keep_originals=False)
         assert outcome.status == "refused"
         assert outcome.detail == "shared_album"
-        # Only the source hash was ever looked up -- the gate refused before
-        # the replacement's own content hash was ever resolved.
-        assert library.names() == ["find_uploaded", "get_item"]
+        # The gate refused before the replacement's content hash was resolved.
+        assert library.names() == ["get_item"]
         assert "restore_metadata" not in library.names()
         assert "trash" not in library.names()
 
@@ -248,7 +257,7 @@ class TestReplaceOneOrder:
         settings = settings_for(tmp_path)
         job = make_job(tmp_path, media_key="KEY1")
         original = make_item("KEY1")
-        library = FakeLibrary(by_hash={"IMG_1.jpg": original}, items={"KEY1": original})
+        library = FakeLibrary(items={"KEY1": original})
         # find_uploaded(output) resolves to nothing because "out.avif" is not in by_hash.
         with pytest.raises(ReplaceError, match="not found by content hash"):
             replace_one(library, job, settings=settings, ffprobe="ffprobe", apply=True, keep_originals=False)
@@ -260,7 +269,7 @@ class TestReplaceOneOrder:
         job = make_job(tmp_path, media_key="KEY1")
         original = make_item("KEY1")
         library = FakeLibrary(
-            by_hash={"IMG_1.jpg": original, "out.avif": original},
+            by_hash={"out.avif": original},
             items={"KEY1": original},
         )
         with pytest.raises(ReplaceError, match="not distinct"):
@@ -276,15 +285,15 @@ class TestReplaceOneOrder:
         original = make_item("KEY1")
         replacement = make_item("REPL1")
         library = FakeLibrary(
-            by_hash={"IMG_1.jpg": original, "out.avif": replacement},
+            by_hash={"out.avif": replacement},
             items={"KEY1": original},
         )
         outcome = replace_one(library, job, settings=settings, ffprobe="ffprobe", apply=False, keep_originals=False)
         assert outcome.status == "would_replace"
         assert not (set(library.names()) & MUTATING_CALLS)
-        # Reads still happen -- confirm_original, get_item, and the
-        # replacement's own hash lookup are all needed to report accurately.
-        assert library.names() == ["find_uploaded", "get_item", "find_uploaded"]
+        # Reads still happen -- the original by key, and the replacement by
+        # its own hash, are both needed to report accurately.
+        assert library.names() == ["get_item", "find_uploaded"]
 
     def test_verify_failure_prevents_trash(self, tmp_path, monkeypatch):
         """trash must never run once verification has raised."""
@@ -295,14 +304,13 @@ class TestReplaceOneOrder:
         original = make_item("KEY1")
         replacement = make_item("REPL1")
         library = FakeLibrary(
-            by_hash={"IMG_1.jpg": original, "out.avif": replacement},
+            by_hash={"out.avif": replacement},
             items={"KEY1": original},
             verify_error=ReplaceError("replacement verification failed"),
         )
         with pytest.raises(ReplaceError, match="verification failed"):
             replace_one(library, job, settings=settings, ffprobe="ffprobe", apply=True, keep_originals=False)
         assert library.names() == [
-            "find_uploaded",
             "get_item",
             "find_uploaded",
             "trust_replacement",
@@ -319,7 +327,7 @@ class TestReplaceOneOrder:
         original = make_item("KEY1")
         replacement = make_item("REPL1")
         library = FakeLibrary(
-            by_hash={"IMG_1.jpg": original, "out.avif": replacement},
+            by_hash={"out.avif": replacement},
             items={"KEY1": original},
             trash_confirms=False,
         )
@@ -334,14 +342,13 @@ class TestReplaceOneOrder:
         original = make_item("KEY1")
         replacement = make_item("REPL1")
         library = FakeLibrary(
-            by_hash={"IMG_1.jpg": original, "out.avif": replacement},
+            by_hash={"out.avif": replacement},
             items={"KEY1": original},
         )
         outcome = replace_one(library, job, settings=settings, ffprobe="ffprobe", apply=True, keep_originals=False)
         assert outcome.status == "replaced"
         assert outcome.original_media_key == "KEY1"
         assert library.names() == [
-            "find_uploaded",
             "get_item",
             "find_uploaded",
             "trust_replacement",
@@ -358,7 +365,7 @@ class TestReplaceOneOrder:
         original = make_item("KEY1")
         replacement = make_item("REPL1")
         library = FakeLibrary(
-            by_hash={"IMG_1.jpg": original, "out.avif": replacement},
+            by_hash={"out.avif": replacement},
             items={"KEY1": original},
         )
         outcome = replace_one(library, job, settings=settings, ffprobe="ffprobe", apply=True, keep_originals=True)
@@ -380,7 +387,7 @@ class TestReplacementTrust:
 
     def _library(self, original, replacement, **kw):
         return FakeLibrary(
-            by_hash={"IMG_1.jpg": original, "out.avif": replacement},
+            by_hash={"out.avif": replacement},
             items={original["id"]: original},
             **kw,
         )
@@ -403,7 +410,7 @@ class TestReplacementTrust:
                     settings=settings_for(tmp_path), ffprobe="ffprobe",
                     apply=True, keep_originals=False)
         names = library.names()
-        assert names.index("trust_replacement") > names.index("find_uploaded", 1)
+        assert names.index("trust_replacement") > names.index("find_uploaded")
         assert names.index("trust_replacement") < names.index("restore_metadata")
 
     def test_only_the_replacement_is_trusted_never_the_original(self, tmp_path, monkeypatch):

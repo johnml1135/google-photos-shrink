@@ -5,23 +5,20 @@ step runs on the browser session. It is short: the Takeout sidecar already gave
 us each item's media key, so there is no library scan.
 
 This is the only code here that destroys anything, so every deletion has to
-earn it. `replace_one` is the whole safety property: ten steps, in order, each
-a refusal point. An original is trashed only when all ten hold:
+earn it. `replace_one` is the whole safety property: nine steps, in order, each
+a refusal point. An original is trashed only when all nine hold:
 
   1. the job names a media key
-  2. `confirm_original` -- hash the exported original, require it to resolve
-     to that key. A media key alone is a *claim*; the content hash is proof.
-  3. `get_item` -- fetch the full library item, and reconcile it against the
-     proven item from step 2 (same id) rather than silently trusting either
-     one alone
-  4. the configured gate (`policy.verdict`) allows it -- shared albums, date
+  2. `confirm_original` -- fetch the item by that key, and require it to have
+     the same id and exactly the exported original's size in bytes
+  3. the configured gate (`policy.verdict`) allows it -- shared albums, date
      and name exclusions, and items that consume no quota are all refused
-  5. the replacement exists and resolves by its own content hash
-  6. `check_identity` -- the replacement is a distinct item from the original
-  7. `output_info_for` -- hash and path the verification requires
-  8. `restore_metadata`
-  9. `verify_replacement`
-  10. `trash`, confirmed by `is_trashed`
+  4. the replacement exists and resolves by its own content hash
+  5. `check_identity` -- the replacement is a distinct item from the original
+  6. `output_info_for` -- hash and path the verification requires
+  7. `restore_metadata`
+  8. `verify_replacement`
+  9. `trash`, confirmed by `is_trashed`
 
 Dry run is the default. Every original also remains in the Takeout export on
 disk, so even a mistake is recoverable by re-upload.
@@ -56,43 +53,31 @@ def check_identity(original: dict[str, Any], replacement: dict[str, Any]) -> Non
 
 
 def confirm_original(library: Any, source: Path, media_key: str) -> dict[str, Any]:
-    """Prove the library item we are about to trash is the photo we encoded.
+    """Fetch the library item the sidecar names, and check it is this export.
 
-    The sidecar's media key is a claim; hashing the exported bytes and asking
-    the library which item owns them is proof. Both must name the same item.
+    The media key is read from the sidecar, and sidecars are paired to media by
+    filename -- which `takeout` has to de-truncate, so a pairing can be wrong.
+    The key is accepted when the item it names agrees with the exported file:
+    the same id, and exactly the same size in bytes.
+
+    Google's search by content hash is deliberately not used. On the live
+    library it missed items whose bytes it held, and for an exact duplicate it
+    returned the other copy -- refusing correct pairings while costing a lookup
+    for every item.
     """
 
     if not source.is_file():
         raise ReplaceError(f"source original is missing from the export: {source}")
-    found = library.find_uploaded(source)
-    if found is None:
+    item = library.get_item(media_key)
+    if str(item.get("id")) != str(media_key):
+        raise ReplaceError(f"get_item returned {item.get('id')} for the sidecar's {media_key}")
+    exported = source.stat().st_size
+    if item.get("size_bytes") != exported:
         raise ReplaceError(
-            "the exported original's bytes do not resolve to any library item; "
-            "cannot prove which item to trash"
+            f"library item is {item.get('size_bytes')} bytes but the exported original is "
+            f"{exported}; the sidecar may describe a different file"
         )
-    if str(found.get("id")) != str(media_key):
-        raise ReplaceError(
-            f"content hash resolves to {found.get('id')} but the sidecar claims {media_key}"
-        )
-    return found
-
-
-def _fetch_full_item(library: Any, media_key: str, proven: dict[str, Any]) -> dict[str, Any]:
-    """Fetch the fuller item `get_item` offers, without discarding the proof.
-
-    `confirm_original` already proved which item this is by content hash;
-    `get_item` is only asked for the richer view (album membership, dedup
-    key) that the hash-match response may not carry. The two must name the
-    same item, or the fuller item is not trusted -- one is never allowed to
-    silently replace the other.
-    """
-
-    full = library.get_item(media_key)
-    if str(full.get("id")) != str(proven.get("id")):
-        raise ReplaceError(
-            f"get_item returned {full.get('id')} but the content hash proved {proven.get('id')}"
-        )
-    return full
+    return item
 
 
 def output_info_for(record: UploadRecord, output: Path, ffprobe: str) -> dict[str, Any]:
@@ -150,9 +135,8 @@ def replace_one(
     if job.source is None:
         raise ReplaceError("no source original recorded for this upload")
 
-    # Proof of identity before anything else touches this item.
-    proven = confirm_original(library, job.source, media_key)
-    original = _fetch_full_item(library, media_key, proven)
+    # Identity before anything else touches this item.
+    original = confirm_original(library, job.source, media_key)
 
     blocked = verdict(settings, Candidate.from_library_item(original))
     if blocked:

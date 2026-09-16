@@ -887,7 +887,11 @@ class GooglePhotosRemote:
             for album in fresh_metadata.get("albums", [])
             if isinstance(album, dict)
         }
-        if fresh_albums != original_albums:
+        # Every album the original is in must hold the replacement. An extra
+        # album is allowed -- the uploader files replacements into its own batch
+        # album -- unless it is shared, which would expose the photo further.
+        extra_shared = {album for album in fresh_albums - original_albums if album[2]}
+        if not original_albums <= fresh_albums or extra_shared:
             raise RemoteProtocolError("replacement albums do not match original metadata")
         expected_sha = output_info.get("sha256") or output_info.get("output_sha256")
         output_path = output_info.get("path") or output_info.get("output_path")
