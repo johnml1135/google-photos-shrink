@@ -56,19 +56,33 @@ def output_path(entry: takeout.MirrorEntry, target_dir: Path) -> Path:
     return target_dir / f"{entry.path.stem}-{(entry.media_key or '')[3:15]}{suffix}"
 
 
-def carried_rows(path: Path, covered: set[str]) -> list[dict]:
-    """Rows in an existing report that this run will not rewrite.
-
-    A run narrowed with --kinds or --limit only builds rows for what it
-    touched. Writing just those would drop every other row from the report --
-    so re-encoding videos would silently delete the photo rows the uploader
-    reads, and with them the record of ten thousand encodes.
-    """
+def load_report(path: Path) -> list[dict]:
+    """Every row of an existing report, in order; empty when there is none."""
 
     if not path.is_file():
         return []
     with open(path, newline="", encoding="utf-8") as handle:
-        return [row for row in csv.DictReader(handle) if row.get("source") not in covered]
+        return list(csv.DictReader(handle))
+
+
+def merge_report(original: list[dict], produced: list[dict]) -> list[dict]:
+    """The existing report with this run's rows swapped in, in place.
+
+    A run narrowed with --kinds, stopped by --limit, or killed partway only
+    produces rows for what it actually reached. Every other row must survive,
+    or re-encoding videos deletes the photo rows the uploader reads.
+
+    What to keep is decided from the rows the run *produced*, never from the
+    items it *considered*. The first version keyed on the considered set, and
+    --limit stops a run long before it reaches everything it considered: its
+    first real use dropped 9,934 of 10,184 rows. A row this run did not write
+    is kept, full stop.
+    """
+
+    fresh = {row["source"]: row for row in produced}
+    merged = [fresh.pop(row.get("source"), row) for row in original]
+    merged.extend(fresh.values())  # sources the existing report never had
+    return merged
 
 
 def write_report(path: Path, rows: list[dict]) -> None:
@@ -114,6 +128,13 @@ def main() -> int:
     report_path = args.report or work / "encoded.csv"
     ffprobe = config.tools["ffprobe"]
 
+    # Say where this run reads and writes before doing anything. work_dir
+    # defaults to the repo's .photos-shrink, and a run that meant to resume a
+    # library encoded elsewhere will find no outputs there and quietly start
+    # over -- two hours of re-encoding, with nothing on screen to show it.
+    existing = sum(1 for _ in target_dir.iterdir()) if target_dir.is_dir() else 0
+    print(f"  outputs: {target_dir}  ({existing:,} already there)", flush=True)
+    print(f"  report : {report_path}", flush=True)
     print(f"Scanning {args.root} ...", flush=True)
     entries = takeout.mirror(args.root)
     kinds = {"photo", "video"} if args.kinds == "all" else {args.kinds}
@@ -123,11 +144,11 @@ def main() -> int:
     entries.sort(key=lambda e: (e.kind != "photo", -e.size_bytes))
     print(f"  {len(entries):,} candidate item(s)", flush=True)
 
-    # Read once, before anything is written, so the rows this run is not
-    # responsible for survive it.
-    carried = carried_rows(report_path, {str(e.path) for e in entries})
-    if carried:
-        print(f"  {len(carried):,} row(s) carried from the existing report", flush=True)
+    # Snapshot once, before anything is written: every flush merges this
+    # run's rows into it, so a run that stops early leaves the rest intact.
+    original_rows = load_report(report_path)
+    if original_rows:
+        print(f"  {len(original_rows):,} existing row(s); only rows this run reaches change", flush=True)
 
     rows: list[dict] = []
     encoded = reused = skipped = 0
@@ -222,9 +243,9 @@ def main() -> int:
                 flush=True,
             )
         if len(rows) % FLUSH_EVERY == 0:
-            write_report(report_path, carried + rows)
+            write_report(report_path, merge_report(original_rows, rows))
 
-    write_report(report_path, carried + rows)
+    write_report(report_path, merge_report(original_rows, rows))
     print(f"\n--- encoded {encoded:,}, reused {reused:,}, skipped {skipped:,} ---", flush=True)
     if total_old:
         saved = total_old - total_new

@@ -1,12 +1,18 @@
 """Tests for the encoder's report, which every later step reads.
 
 The report is the only record that an encode happened. A run that narrows
-itself with --kinds or --limit must not take the rest of it down.
+itself with --kinds, stops at --limit, or is killed partway must not take the
+rest of it down.
+
+The first version of this protection decided what to keep from the items a run
+*considered*. Its first real use was a `--limit 50` run, which considered 9,988
+photos, reached 50, and dropped 9,934 rows. Its tests passed a considered set
+that happened to equal what was rewritten, so none of them exercised the gap.
+The tests below are written against that gap first.
 """
 
 from __future__ import annotations
 
-import csv
 import importlib.util
 import sys
 from pathlib import Path
@@ -17,62 +23,90 @@ takeout_encode = importlib.util.module_from_spec(spec)
 sys.modules["takeout_encode"] = takeout_encode
 spec.loader.exec_module(takeout_encode)
 
-
-def write_rows(path: Path, rows: list[dict]) -> None:
-    takeout_encode.write_report(path, rows)
+merge_report = takeout_encode.merge_report
 
 
-def read_rows(path: Path) -> list[dict]:
-    with open(path, newline="", encoding="utf-8") as handle:
-        return list(csv.DictReader(handle))
+def row(name: str, **fields) -> dict:
+    return {"source": f"G:/in/{name}", "status": "encoded", "new_bytes": "10", **fields}
 
 
-PHOTO = {"source": "G:/in/a.jpg", "output": "G:/out/a.avif", "status": "encoded",
-         "old_bytes": "100", "new_bytes": "10", "saved_percent": "90.0"}
-VIDEO = {"source": "G:/in/b.mp4", "output": "G:/out/b.mp4", "status": "encoded",
-         "old_bytes": "900", "new_bytes": "300", "saved_percent": "66.7"}
+def sources(rows: list[dict]) -> list[str]:
+    return [r["source"] for r in rows]
 
 
-class TestCarriedRows:
-    def test_a_video_only_run_keeps_the_photo_rows(self, tmp_path):
-        """The bug: re-encoding videos deleted ten thousand photo rows."""
+class TestMergeReport:
+    def test_a_limited_run_keeps_every_row_it_never_reached(self):
+        """The 9,934-row loss: considered everything, reached one."""
+
+        original = [row("A.jpg"), row("B.jpg"), row("C.jpg")]
+        produced = [row("A.jpg", new_bytes="7")]
+
+        merged = merge_report(original, produced)
+
+        assert sources(merged) == sources(original)
+        assert merged[0]["new_bytes"] == "7"
+        assert merged[1]["new_bytes"] == merged[2]["new_bytes"] == "10"
+
+    def test_a_video_only_run_keeps_the_photo_rows(self):
+        original = [row("a.jpg"), row("b.mp4")]
+        produced = [row("b.mp4", new_bytes="3")]
+
+        merged = merge_report(original, produced)
+
+        assert sources(merged) == ["G:/in/a.jpg", "G:/in/b.mp4"]
+        assert merged[1]["new_bytes"] == "3"
+
+    def test_a_run_that_produced_nothing_leaves_the_report_unchanged(self):
+        """A run killed before its first row must not empty the report."""
+
+        original = [row("A.jpg"), row("B.jpg")]
+        assert merge_report(original, []) == original
+
+    def test_a_rewritten_row_replaces_its_predecessor_in_place(self):
+        """No duplicates, and the row does not move to the end."""
+
+        original = [row("A.jpg"), row("B.jpg"), row("C.jpg")]
+        produced = [row("B.jpg", status="skipped")]
+
+        merged = merge_report(original, produced)
+
+        assert len(merged) == 3
+        assert sources(merged) == sources(original)
+        assert merged[1]["status"] == "skipped"
+
+    def test_a_re_gate_can_turn_an_encoded_row_into_a_skip(self):
+        """The point of re-running: the newest verdict on a source wins."""
+
+        original = [row("big.jpg", saved_percent="-54.5")]
+        produced = [row("big.jpg", status="skipped", reason="insufficient savings")]
+
+        assert merge_report(original, produced)[0]["status"] == "skipped"
+
+    def test_a_source_the_report_never_had_is_appended(self):
+        original = [row("A.jpg")]
+        produced = [row("NEW.mp4")]
+
+        assert sources(merge_report(original, produced)) == ["G:/in/A.jpg", "G:/in/NEW.mp4"]
+
+    def test_no_existing_report_is_just_the_new_rows(self):
+        produced = [row("A.jpg"), row("B.jpg")]
+        assert merge_report([], produced) == produced
+
+
+class TestReportRoundTrip:
+    def test_a_limited_run_leaves_the_file_whole(self, tmp_path):
+        """Through the real files, the way the encoder actually uses them."""
 
         report = tmp_path / "encoded.csv"
-        write_rows(report, [PHOTO, VIDEO])
+        takeout_encode.write_report(report, [row(f"{i}.jpg") for i in range(100)])
 
-        carried = takeout_encode.carried_rows(report, {VIDEO["source"]})
-        assert [r["source"] for r in carried] == [PHOTO["source"]]
+        original = takeout_encode.load_report(report)
+        takeout_encode.write_report(report, merge_report(original, [row("0.jpg", new_bytes="1")]))
 
-    def test_rows_this_run_covers_are_not_carried(self, tmp_path):
-        """Otherwise a re-encode would leave its own stale row behind beside it."""
+        after = takeout_encode.load_report(report)
+        assert len(after) == 100
+        assert after[0]["new_bytes"] == "1"
+        assert all(r["new_bytes"] == "10" for r in after[1:])
 
-        report = tmp_path / "encoded.csv"
-        write_rows(report, [PHOTO, VIDEO])
-
-        carried = takeout_encode.carried_rows(report, {PHOTO["source"], VIDEO["source"]})
-        assert carried == []
-
-    def test_no_existing_report_carries_nothing(self, tmp_path):
-        assert takeout_encode.carried_rows(tmp_path / "absent.csv", {"x"}) == []
-
-    def test_the_rewritten_report_holds_both_halves(self, tmp_path):
-        """End to end: carried rows plus this run's rows, no loss, no duplicates."""
-
-        report = tmp_path / "encoded.csv"
-        write_rows(report, [PHOTO, VIDEO])
-
-        carried = takeout_encode.carried_rows(report, {VIDEO["source"]})
-        reencoded = dict(VIDEO, new_bytes="200", saved_percent="77.8")
-        write_rows(report, carried + [reencoded])
-
-        rows = read_rows(report)
-        assert len(rows) == 2
-        by_source = {r["source"]: r for r in rows}
-        assert by_source[PHOTO["source"]]["new_bytes"] == "10"
-        assert by_source[VIDEO["source"]]["new_bytes"] == "200"
-
-    def test_a_carried_row_keeps_every_column(self, tmp_path):
-        report = tmp_path / "encoded.csv"
-        write_rows(report, [PHOTO])
-        carried = takeout_encode.carried_rows(report, set())
-        assert {k: carried[0][k] for k in PHOTO} == PHOTO
+    def test_a_report_that_does_not_exist_loads_empty(self, tmp_path):
+        assert takeout_encode.load_report(tmp_path / "absent.csv") == []
