@@ -1,8 +1,11 @@
-"""Browser authentication and local Netscape cookie handling.
+"""Browser session recovery and local Netscape cookie handling.
 
-The browser is deliberately kept separate from gpwc's requests session.  The
-two sessions are compared by Google's stable ``oPEP7c`` identity before a
-browser upload is attempted.
+Exported cookies go stale within about fifteen minutes, so this keeps a
+dedicated Chrome profile that can mint a fresh session without a manual
+re-export. The browser is deliberately kept separate from gpwc's requests
+session, and the two are compared by Google's stable ``oPEP7c`` identity
+before either is trusted -- acting on the wrong account is the one mistake
+here that cannot be undone.
 """
 
 from __future__ import annotations

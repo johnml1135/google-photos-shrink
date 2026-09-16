@@ -30,10 +30,8 @@ pause_seconds = 10
 minimum_savings_percent = 20
 threads = 2
 skip_shared = false
-limit = 0
 skip_non_space_consuming = true
 photos_only = false
-selection_order = "largest"
 
 [exclude]
 timezone = "America/New_York"

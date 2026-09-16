@@ -67,19 +67,12 @@ def test_pilot_selection_defaults_and_validation(tmp_path: Path):
     cfg = load_config(path)
     assert cfg.google["session_refresh_seconds"] == 300
     assert cfg.run["photos_only"] is False
-    assert cfg.run["selection_order"] == "largest"
 
     path.write_text("[google]\nsession_refresh_seconds = -1\n", encoding="utf-8")
     with pytest.raises(ConfigError, match="session_refresh_seconds"):
         load_config(path)
     path.write_text("[run]\nphotos_only = 'yes'\n", encoding="utf-8")
     with pytest.raises(ConfigError, match="photos_only"):
-        load_config(path)
-    path.write_text("[run]\nselection_order = 'oldest'\n", encoding="utf-8")
-    with pytest.raises(ConfigError, match="selection_order"):
-        load_config(path)
-    path.write_text("[run]\nselection_order = ['newest']\n", encoding="utf-8")
-    with pytest.raises(ConfigError, match="selection_order"):
         load_config(path)
     path.write_text("[google]\nsession_refresh_seconds = -1\n", encoding="utf-8")
     with pytest.raises(ConfigError, match="session_refresh_seconds"):
@@ -92,7 +85,20 @@ def test_control_settings_do_not_change_encoding_fingerprint(tmp_path: Path):
     original = load_config(path).fingerprint
     path.write_text(
         "[google]\nsession_refresh_seconds = 0\n"
-        "[run]\nphotos_only = true\nselection_order = 'newest'\nlimit = 1\n",
+        "[run]\nphotos_only = true\n",
         encoding="utf-8",
     )
     assert load_config(path).fingerprint == original
+
+
+def test_the_shipped_shrink_toml_actually_loads():
+    """The suite builds its own configs, so nothing else reads the real one.
+
+    A key removed from DEFAULTS but left in the shipped shrink.toml passes
+    every other test here and then fails at startup for every tool.
+    """
+
+    from photos_shrink.config import load_config as _load
+
+    shipped = Path(__file__).resolve().parents[1] / "shrink.toml"
+    assert _load(shipped).run["work_dir"]

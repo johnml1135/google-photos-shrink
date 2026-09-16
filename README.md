@@ -259,9 +259,9 @@ uv run python tools/takeout_replace.py --journal G:/takeout-work/journal.json --
 
 Restores the original's capture time, description, favourite and archive state,
 location and album membership onto the replacement, verifies it, and only then
-moves the original to Google Photos trash. This is the sequence the main
-pipeline uses, in the same order, and it is the closest thing to replacement
-that exists — no API or web client can swap an item's bytes in place.
+moves the original to Google Photos trash. It is the closest thing to
+replacement that exists — no API or web client can swap an item's bytes in
+place.
 
 This step needs the browser session, because the API can neither write album
 membership nor delete. It is nonetheless short: the mirror already supplies each

@@ -28,8 +28,8 @@ DEFAULTS: dict[str, dict[str, Any]] = {
                "browser_channel": "chrome", "browser_headless": True, "account_index": 0,
                "session_refresh_seconds": 300},
     "run": {"work_dir": ".photos-shrink", "pause_seconds": 10, "minimum_savings_percent": 20,
-            "threads": 2, "skip_shared": True, "limit": 0, "skip_non_space_consuming": True,
-            "photos_only": False, "selection_order": "largest"},
+            "threads": 2, "skip_shared": True, "skip_non_space_consuming": True,
+            "photos_only": False},
     "exclude": {"timezone": "America/New_York", "date_ranges": [], "name_globs": []},
 }
 ALLOWED = {name: set(values) for name, values in DEFAULTS.items()}
@@ -113,8 +113,6 @@ def load_config(path: str | os.PathLike[str] = "shrink.toml") -> Settings:
         raise ConfigError("run.skip_shared and run.skip_non_space_consuming must be booleans")
     if not isinstance(values["run"]["photos_only"], bool):
         raise ConfigError("run.photos_only must be a boolean")
-    if not isinstance(values["run"]["selection_order"], str) or values["run"]["selection_order"] not in {"largest", "newest"}:
-        raise ConfigError("run.selection_order must be largest or newest")
     if isinstance(values["google"]["account_index"], bool) or not isinstance(values["google"]["account_index"], int) or values["google"]["account_index"] < 0:
         raise ConfigError("google.account_index must be an integer >= 0")
     if not isinstance(values["google"]["browser_headless"], bool):
@@ -135,7 +133,7 @@ def load_config(path: str | os.PathLike[str] = "shrink.toml") -> Settings:
         raise ConfigError("videos.audio_bitrate_kbps must be positive")
     if values["videos"]["preset"] not in {"ultrafast", "superfast", "veryfast", "faster", "fast", "medium", "slow", "slower", "veryslow", "placebo"}:
         raise ConfigError("videos.preset is not a supported ffmpeg preset")
-    for key in ("pause_seconds", "threads", "limit"):
+    for key in ("pause_seconds", "threads"):
         _positive_int(values["run"][key], f"run.{key}")
     if values["run"]["threads"] == 0:
         raise ConfigError("run.threads must be at least 1")

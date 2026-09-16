@@ -1,9 +1,9 @@
 """Tests for the one module that decides whether a photo may be replaced.
 
-`verdict` is the single gate every replacement path -- the live pipeline and
-the offline Takeout encoder -- must pass through. The properties that matter
-most: an unknown value is never treated as a refusal, and the tokens the
-pipeline has always returned keep returning unchanged.
+`verdict` is the single gate every replacement path -- the offline Takeout
+encoder and the live replace step -- must pass through. The properties that
+matter most: an unknown value is never treated as a refusal, and each refusal
+token keeps its exact spelling, because reports and journals record them.
 """
 
 from __future__ import annotations

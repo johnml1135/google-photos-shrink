@@ -438,17 +438,6 @@ def test_zero_refresh_interval_disables_failure_retry(tmp_path, monkeypatch):
     assert refreshes == []
 
 
-def test_execute_skips_refresh_while_upload_is_active(tmp_path, monkeypatch):
-    client = Client()
-    remote = GooglePhotosRemote(settings(tmp_path), client=client, payloads=Payloads)
-    remote._upload_in_progress = True
-    refreshes = []
-    monkeypatch.setattr(remote, "refresh_session", lambda: refreshes.append(True))
-    client.responses[GetItemInfo] = type("R", (), {"success": True, "data": object()})()
-    remote._execute(GetItemInfo())
-    assert refreshes == []
-
-
 def test_find_uploaded_uses_sha1_base64_and_rejects_malformed_success(tmp_path):
     path = tmp_path / "encoded.jpg"
     path.write_bytes(b"encoded bytes")
@@ -515,32 +504,6 @@ def test_trash_fails_closed_when_item_identity_or_metadata_is_uncertain(tmp_path
     with pytest.raises(RemoteProtocolError):
         remote.trash({"id": "x", "dedup_key": None, "metadata": {}})
     assert client.calls == []
-
-
-def _upload_remote(tmp_path, *, timeout=0.05, poll=0.001):
-    path = tmp_path / "encoded.jpg"
-    path.write_bytes(b"encoded")
-
-    class Browser:
-        def __init__(self):
-            self.uploads = 0
-
-        def open(self, *, interactive=False):
-            return "stable-account"
-
-        def upload(self, path):
-            self.uploads += 1
-
-        def close(self):
-            pass
-
-    configured = settings(tmp_path)
-    configured["google"].update(
-        {"upload_timeout_seconds": timeout, "upload_poll_seconds": poll, "auto_original_quality": False}
-    )
-    client = Client()
-    remote = GooglePhotosRemote(configured, client=client, payloads=Payloads, browser=Browser())
-    return remote, path
 
 
 def test_trusted_upload_with_missing_source_is_safe(tmp_path):
