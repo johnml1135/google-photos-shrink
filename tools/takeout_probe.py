@@ -17,11 +17,13 @@ import argparse
 import collections
 import json
 import random
+import sys
+from contextlib import ExitStack
 from pathlib import Path
 
 from photos_shrink import takeout
 from photos_shrink.config import load_config
-from photos_shrink.remote import GooglePhotosRemote
+from photos_shrink.remote import COOKIE_HINT, RemoteProtocolError, open_session
 
 
 def inventory(root: Path) -> list[takeout.TakeoutRecord]:
@@ -127,9 +129,17 @@ def main() -> int:
     if not args.offline:
         chosen = sample(records, args.sample, stratified=args.stratified)
         print(f"\n--- Hash-matching {len(chosen)} sampled files against the library ---", flush=True)
-        remote = GooglePhotosRemote(load_config(args.config).as_dict())
-        try:
-            print(f"Account: {remote.login()}", flush=True)
+        with ExitStack() as stack:
+            # enter_context, not a bare call: open_session is a generator
+            # context manager, so the login only runs on __enter__ and a bare
+            # call would let an expired cookie escape this handler.
+            try:
+                remote = stack.enter_context(open_session(load_config(args.config)))
+            except RemoteProtocolError as exc:
+                print(f"\n{exc}", file=sys.stderr)
+                print(COOKIE_HINT, file=sys.stderr)
+                return 2
+            print(f"Account: {remote.account_id()}", flush=True)
             hits = 0
             for index, record in enumerate(chosen, 1):
                 try:
@@ -179,8 +189,6 @@ def main() -> int:
                 print("  => Partial. Inspect the misses before trusting hash-targeted deletion.", flush=True)
             else:
                 print("  => No matches. Takeout is rewriting bytes; hash join will NOT work.", flush=True)
-        finally:
-            remote.close()
 
     args.report.parent.mkdir(parents=True, exist_ok=True)
     args.report.write_text(json.dumps(report, indent=2), encoding="utf-8")

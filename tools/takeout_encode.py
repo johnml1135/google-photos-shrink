@@ -97,7 +97,7 @@ def main() -> int:
     target_dir = work / "out"
     target_dir.mkdir(parents=True, exist_ok=True)
     report_path = args.report or work / "encoded.csv"
-    ffprobe = settings.get("tools", {}).get("ffprobe", "ffprobe")
+    ffprobe = config.tools["ffprobe"]
 
     print(f"Scanning {args.root} ...", flush=True)
     entries = takeout.mirror(args.root)

@@ -19,10 +19,11 @@ import mimetypes
 import os
 import tempfile
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager
 from dataclasses import asdict, is_dataclass
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 from urllib.parse import urlparse
 
 from .auth import (
@@ -31,6 +32,9 @@ from .auth import (
     write_netscape_cookies,
 )
 from .integrity import sha256_file
+
+if TYPE_CHECKING:
+    from .config import Settings
 
 
 class RemoteProtocolError(RuntimeError):
@@ -790,6 +794,32 @@ class GooglePhotosRemote:
             )
             self._execute(payload_type([replacement["id"]], album["id"]))
 
+    @staticmethod
+    def _require_matching(
+        expected: dict[str, Any],
+        actual: dict[str, Any],
+        keys: tuple[str, ...],
+        message: str,
+        *,
+        expected_required: bool = False,
+    ) -> None:
+        """Raise unless `actual` agrees with `expected` on every key.
+
+        Both paths that can destroy something -- verifying a replacement and
+        trashing an original -- re-read the item from the server and compare it
+        against what they believed. That comparison was written out six times;
+        one copy is one place to get it right.
+
+        `expected_required` additionally rejects a key we never knew a value
+        for, because "unknown" is not evidence that nothing changed.
+        """
+
+        for key in keys:
+            if expected_required and expected.get(key) is None:
+                raise RemoteProtocolError(message.format(key=key))
+            if actual.get(key) != expected.get(key):
+                raise RemoteProtocolError(message.format(key=key))
+
     def verify_replacement(self, original: dict[str, Any], replacement: dict[str, Any], output_info: dict[str, Any]) -> None:
         required = ("id", "dedup_key", "size_bytes", "width", "height", "kind")
         if any(key not in replacement or replacement[key] in (None, "") for key in required):
@@ -797,29 +827,30 @@ class GooglePhotosRemote:
         if replacement.get("id") == original.get("id") or replacement.get("dedup_key") == original.get("dedup_key"):
             raise RemoteProtocolError("replacement identity is the original item")
         fresh = self.get_item(str(replacement["id"]))
-        for key in required:
-            if fresh.get(key) != replacement.get(key):
-                raise RemoteProtocolError(f"replacement {key} changed unexpectedly")
-        for key in ("size_bytes", "width", "height", "kind"):
-            if output_info.get(key) != fresh.get(key):
-                raise RemoteProtocolError(f"replacement {key} does not match encoded output")
+        self._require_matching(replacement, fresh, required, "replacement {key} changed unexpectedly")
+        self._require_matching(
+            output_info, fresh, ("size_bytes", "width", "height", "kind"),
+            "replacement {key} does not match encoded output",
+        )
         if output_info.get("kind") == "video":
             expected_duration = output_info.get("duration_seconds")
             actual_duration = fresh.get("duration_seconds")
             if expected_duration is None or actual_duration is None or abs(expected_duration - actual_duration) > 0.25:
                 raise RemoteProtocolError("replacement duration does not match encoded output")
-        for key in ("timestamp_ms", "timezone_offset"):
-            if original.get(key) is None or fresh.get(key) != original.get(key):
-                raise RemoteProtocolError(f"replacement {key} does not match original capture metadata")
+        self._require_matching(
+            original, fresh, ("timestamp_ms", "timezone_offset"),
+            "replacement {key} does not match original capture metadata", expected_required=True,
+        )
         if fresh.get("skip_reason"):
             raise RemoteProtocolError("replacement has an unsafe metadata state")
         original_metadata = original.get("metadata")
         fresh_metadata = fresh.get("metadata")
         if not isinstance(original_metadata, dict) or not isinstance(fresh_metadata, dict):
             raise RemoteProtocolError("replacement metadata is incomplete")
-        for key in ("description", "favorite", "archived"):
-            if fresh_metadata.get(key) != original_metadata.get(key):
-                raise RemoteProtocolError(f"replacement {key} does not match original metadata")
+        self._require_matching(
+            original_metadata, fresh_metadata, ("description", "favorite", "archived"),
+            "replacement {key} does not match original metadata",
+        )
         original_location = self._validate_location(
             original_metadata.get("latitude"), original_metadata.get("longitude")
         )
@@ -862,18 +893,21 @@ class GooglePhotosRemote:
             raise RemoteProtocolError("item identity changed before trash")
         if fresh.get("trashed"):
             return
-        for key in ("size_bytes", "width", "height", "kind", "timestamp_ms", "timezone_offset"):
-            if item.get(key) is None or fresh.get(key) != item.get(key):
-                raise RemoteProtocolError(f"item {key} changed before trash")
+        self._require_matching(
+            item, fresh, ("size_bytes", "width", "height", "kind", "timestamp_ms", "timezone_offset"),
+            "item {key} changed before trash", expected_required=True,
+        )
         if fresh.get("skip_reason"):
             raise RemoteProtocolError("item metadata became unsafe before trash")
         original_metadata = item.get("metadata")
         fresh_metadata = fresh.get("metadata")
         if not isinstance(original_metadata, dict) or not isinstance(fresh_metadata, dict):
             raise RemoteProtocolError("item metadata is incomplete before trash")
-        for key in ("description", "favorite", "archived", "albums", "latitude", "longitude"):
-            if fresh_metadata.get(key) != original_metadata.get(key):
-                raise RemoteProtocolError(f"item {key} changed before trash")
+        self._require_matching(
+            original_metadata, fresh_metadata,
+            ("description", "favorite", "archived", "albums", "latitude", "longitude"),
+            "item {key} changed before trash",
+        )
         self._execute(self._payloads.MoveToTrash([dedup_key]))
 
     def is_trashed(self, item: dict[str, Any]) -> bool:
@@ -888,3 +922,32 @@ class GooglePhotosRemote:
         close = getattr(session, "close", None)
         if callable(close):
             close()
+
+
+@contextmanager
+def open_session(settings: Settings) -> Iterator[GooglePhotosRemote]:
+    """Open a logged-in Google Photos session and always close it again.
+
+    Both tools that need cookies were opening, logging in and closing by hand,
+    and only one of them turned an expired export into a readable message
+    rather than a stack trace. Cookies here last about fifteen minutes, so that
+    is the routine outcome, not the exceptional one.
+
+    Raises `RemoteProtocolError` when no session can be opened; the caller
+    reports it and exits.
+    """
+
+    remote = GooglePhotosRemote(settings.as_dict())
+    try:
+        try:
+            remote.login()
+        except RemoteProtocolError:
+            raise
+        except Exception as exc:  # noqa: BLE001 - browser/auth failures vary
+            raise RemoteProtocolError(f"Google session could not be opened: {exc}") from exc
+        yield remote
+    finally:
+        remote.close()
+
+
+COOKIE_HINT = "Export a fresh cookies.txt into .photos-shrink/ and re-run. Nothing was changed."

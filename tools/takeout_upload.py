@@ -27,7 +27,7 @@ from photos_shrink.photos_api import (
 )
 
 
-def verify_item(item: dict, source: Path, settings: dict) -> tuple[str, str]:
+def verify_item(item: dict, source: Path, ffprobe: str) -> tuple[str, str]:
     """Check the created item against the file that was uploaded.
 
     Byte comparison is impossible through this API: Google re-renders AVIF (and
@@ -46,7 +46,7 @@ def verify_item(item: dict, source: Path, settings: dict) -> tuple[str, str]:
     except (TypeError, ValueError):
         return "unverified", "the API returned no dimensions"
 
-    local = media.probe(source, settings.get("tools", {}).get("ffprobe", "ffprobe"))
+    local = media.probe(source, ffprobe)
     if (width, height) != (local["width"], local["height"]):
         return "mismatch", (
             f"stored {width}x{height} but uploaded {local['width']}x{local['height']}"
@@ -76,6 +76,7 @@ def main() -> int:
 
     settings = load_config(args.config)
     work_dir = Path(settings.run["work_dir"])
+    ffprobe = settings.tools["ffprobe"]
     if args.report is None:
         args.report = work_dir / "encoded.csv"
     if not args.report.exists():
@@ -129,7 +130,7 @@ def main() -> int:
             except PhotosApiError as exc:
                 record.verified, record.verified_detail = "unverified", str(exc)
                 continue
-            verdict, detail = verify_item(stored, record.output, settings.as_dict())
+            verdict, detail = verify_item(stored, record.output, ffprobe)
             record.verified, record.verified_detail = verdict, detail
             record.capture_time = (stored.get("mediaMetadata") or {}).get("creationTime")
             print(f"  {record.output.name}: {verdict}  {detail}", flush=True)
@@ -167,7 +168,7 @@ def main() -> int:
             stored = {}
             print(f"      read-back failed: {exc}", flush=True)
 
-        verdict, detail = verify_item(stored or item, output, settings.as_dict())
+        verdict, detail = verify_item(stored or item, output, ffprobe)
         journal.record(UploadRecord(
             source=Path(row["source"]),
             media_key=row.get("media_key") or "",

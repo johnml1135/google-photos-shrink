@@ -966,3 +966,149 @@ def test_failed_retry_refresh_reports_the_original_read_failure(tmp_path, monkey
     monkeypatch.setattr(remote, "refresh_session", failing_refresh)
     with pytest.raises(RemoteProtocolError, match="refresh-read"):
         remote._execute(GetItemInfo())
+
+
+class _SessionSettings:
+    """Minimal stand-in for Settings: open_session only needs as_dict()."""
+
+    def __init__(self, payload):
+        self._payload = payload
+
+    def as_dict(self):
+        return self._payload
+
+
+def test_open_session_closes_the_remote_even_when_the_body_raises(tmp_path, monkeypatch):
+    from photos_shrink import remote as remote_module
+
+    closed = []
+
+    class FakeRemote:
+        def __init__(self, payload):
+            self.payload = payload
+
+        def login(self):
+            return "stable-account"
+
+        def close(self):
+            closed.append(True)
+
+    monkeypatch.setattr(remote_module, "GooglePhotosRemote", FakeRemote)
+    with pytest.raises(ValueError, match="boom"):
+        with remote_module.open_session(_SessionSettings(settings(tmp_path))):
+            raise ValueError("boom")
+    assert closed == [True]
+
+
+def test_open_session_closes_the_remote_when_login_fails(tmp_path, monkeypatch):
+    """An expired cookie must not leak the session it failed to open."""
+
+    from photos_shrink import remote as remote_module
+
+    closed = []
+
+    class FakeRemote:
+        def __init__(self, payload):
+            pass
+
+        def login(self):
+            raise RemoteProtocolError("cookies.txt is missing")
+
+        def close(self):
+            closed.append(True)
+
+    monkeypatch.setattr(remote_module, "GooglePhotosRemote", FakeRemote)
+    with pytest.raises(RemoteProtocolError, match="cookies.txt is missing"):
+        with remote_module.open_session(_SessionSettings(settings(tmp_path))):
+            pass
+    assert closed == [True]
+
+
+def test_open_session_reports_an_unexpected_login_failure_as_a_protocol_error(tmp_path, monkeypatch):
+    """Callers catch RemoteProtocolError; a raw browser error would escape them."""
+
+    from photos_shrink import remote as remote_module
+
+    class FakeRemote:
+        def __init__(self, payload):
+            pass
+
+        def login(self):
+            raise OSError("chrome would not start")
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(remote_module, "GooglePhotosRemote", FakeRemote)
+    with pytest.raises(RemoteProtocolError, match="chrome would not start"):
+        with remote_module.open_session(_SessionSettings(settings(tmp_path))):
+            pass
+
+
+def test_open_session_logs_in_before_yielding(tmp_path, monkeypatch):
+    """The body must never run against a session that was never logged in."""
+
+    from photos_shrink import remote as remote_module
+
+    order = []
+
+    class FakeRemote:
+        def __init__(self, payload):
+            pass
+
+        def login(self):
+            order.append("login")
+            return "stable-account"
+
+        def close(self):
+            order.append("close")
+
+    monkeypatch.setattr(remote_module, "GooglePhotosRemote", FakeRemote)
+    with remote_module.open_session(_SessionSettings(settings(tmp_path))):
+        order.append("body")
+    assert order == ["login", "body", "close"]
+
+
+class TestRequireMatching:
+    """The comparison both destructive paths run before acting.
+
+    Extracted from six copies; these pin the two semantics those copies had,
+    because a silent change here would let a mutated item be trashed.
+    """
+
+    def test_agreement_on_every_key_passes(self):
+        GooglePhotosRemote._require_matching(
+            {"a": 1, "b": 2}, {"a": 1, "b": 2, "c": 9}, ("a", "b"), "{key} changed"
+        )
+
+    def test_a_disagreement_names_the_key_that_differs(self):
+        with pytest.raises(RemoteProtocolError, match="^b changed$"):
+            GooglePhotosRemote._require_matching(
+                {"a": 1, "b": 2}, {"a": 1, "b": 3}, ("a", "b"), "{key} changed"
+            )
+
+    def test_an_unknown_expected_value_passes_when_not_required(self):
+        """Matching None against None is agreement, where None is allowed."""
+
+        GooglePhotosRemote._require_matching({"a": None}, {"a": None}, ("a",), "{key} changed")
+
+    def test_an_unknown_expected_value_fails_when_required(self):
+        """'We never knew' is not evidence that nothing changed."""
+
+        with pytest.raises(RemoteProtocolError, match="^a changed$"):
+            GooglePhotosRemote._require_matching(
+                {"a": None}, {"a": None}, ("a",), "{key} changed", expected_required=True
+            )
+
+    def test_a_missing_key_on_the_actual_side_is_a_disagreement(self):
+        with pytest.raises(RemoteProtocolError, match="^a changed$"):
+            GooglePhotosRemote._require_matching({"a": 1}, {}, ("a",), "{key} changed")
+
+    def test_it_stops_at_the_first_disagreement(self):
+        with pytest.raises(RemoteProtocolError, match="^a changed$"):
+            GooglePhotosRemote._require_matching(
+                {"a": 1, "b": 2}, {"a": 9, "b": 9}, ("a", "b"), "{key} changed"
+            )
+
+    def test_no_keys_is_vacuously_true(self):
+        GooglePhotosRemote._require_matching({}, {}, (), "{key} changed")

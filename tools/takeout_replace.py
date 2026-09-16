@@ -15,12 +15,13 @@ import argparse
 import csv
 import sys
 import time
+from contextlib import ExitStack
 from dataclasses import replace as _replace
 from pathlib import Path
 
 from photos_shrink.config import load_config
 from photos_shrink.ledger import UploadJournal
-from photos_shrink.remote import GooglePhotosRemote
+from photos_shrink.remote import COOKIE_HINT, RemoteProtocolError, open_session
 from photos_shrink.replacement import replace_one
 
 
@@ -66,20 +67,19 @@ def main() -> int:
     if not args.apply:
         print("\nDRY RUN -- nothing will be changed. Re-run with --apply.\n", flush=True)
 
-    ffprobe = settings.as_dict().get("tools", {}).get("ffprobe", "ffprobe")
-    remote = GooglePhotosRemote(settings.as_dict())
+    ffprobe = settings.tools["ffprobe"]
     replaced = failed = refused = 0
-    try:
+    with ExitStack() as stack:
+        # Entered separately so that a session that cannot be opened -- the
+        # routine case, because cookies last about fifteen minutes -- reports
+        # itself and exits, rather than being caught alongside per-item errors.
         try:
-            print(f"Account: {remote.login()}", flush=True)
-        except Exception as exc:  # noqa: BLE001 - an expired cookie is routine, not a crash
-            print(f"\nCould not open a Google Photos session: {exc}", file=sys.stderr)
-            print(
-                "Export a fresh cookies.txt into .photos-shrink/ and re-run. "
-                "Nothing was changed.",
-                file=sys.stderr,
-            )
+            remote = stack.enter_context(open_session(settings))
+        except RemoteProtocolError as exc:
+            print(f"\n{exc}", file=sys.stderr)
+            print(COOKIE_HINT, file=sys.stderr)
             return 2
+        print(f"Account: {remote.account_id()}", flush=True)
         for index, record in enumerate(todo, 1):
             name = record.source.name if record.source else "?"
             prefix = f"  [{index}/{len(todo)}] {name}:"
@@ -126,8 +126,6 @@ def main() -> int:
                     journal.save()
             if args.pause:
                 time.sleep(args.pause)
-    finally:
-        remote.close()
 
     if args.apply:
         print(f"\n--- replaced {replaced}, refused {refused}, failed {failed} ---", flush=True)
