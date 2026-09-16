@@ -253,8 +253,8 @@ the Storage saver transcoding that affects browser uploads.
 ## Replacing the originals
 
 ```powershell
-uv run python tools/takeout_replace.py --journal G:/takeout-work/journal.json   # dry run
-uv run python tools/takeout_replace.py --journal G:/takeout-work/journal.json --apply
+uv run python tools/takeout_replace.py --journal G:/takeout-work/takeout-upload-journal.json   # dry run
+uv run python tools/takeout_replace.py --journal G:/takeout-work/takeout-upload-journal.json --apply
 ```
 
 Restores the original's capture time, description, favourite and archive state,
@@ -287,13 +287,13 @@ uv run python tools/takeout_encode.py "D:/path/to/Takeout"
 
 # 3. Upload the replacements (OAuth; no cookies)
 uv run python tools/takeout_upload.py --report G:/takeout-work/encoded.csv `
-    --journal G:/takeout-work/journal.json --album "photos-shrink batch 1"
+    --journal G:/takeout-work/takeout-upload-journal.json --album "photos-shrink batch 1"
 
 # 4. See what replacement would do (changes nothing)
-uv run python tools/takeout_replace.py --journal G:/takeout-work/journal.json
+uv run python tools/takeout_replace.py --journal G:/takeout-work/takeout-upload-journal.json
 
 # 5. Replace: restore metadata, verify, trash the originals (browser session)
-uv run python tools/takeout_replace.py --journal G:/takeout-work/journal.json --apply
+uv run python tools/takeout_replace.py --journal G:/takeout-work/takeout-upload-journal.json --apply
 ```
 
 Steps 2 and 3 are resumable and safe to re-run; both track work by the library's

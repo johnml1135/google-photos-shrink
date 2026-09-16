@@ -49,11 +49,11 @@ def iso_timestamp(timestamp_ms: int | None) -> str:
 def main() -> int:
     parser = argparse.ArgumentParser(description="Inventory a Takeout export")
     parser.add_argument("root", type=Path)
-    parser.add_argument("--out", type=Path, default=None, help="Defaults to <work_dir>/mirror.csv")
+    parser.add_argument("--out", type=Path, default=None, help="Defaults to <data_dir>/mirror.csv")
     parser.add_argument("--config", default="shrink.toml")
     args = parser.parse_args()
 
-    out = args.out or Path(load_config(args.config).run["work_dir"]) / "mirror.csv"
+    out = args.out or Path(load_config(args.config).run["data_dir"]) / "mirror.csv"
 
     print(f"Scanning {args.root} ...", flush=True)
     entries = takeout.mirror(args.root)

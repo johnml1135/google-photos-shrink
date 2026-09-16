@@ -102,3 +102,39 @@ def test_the_shipped_shrink_toml_actually_loads():
 
     shipped = Path(__file__).resolve().parents[1] / "shrink.toml"
     assert _load(shipped).run["work_dir"]
+
+
+def test_data_dir_falls_back_to_work_dir_when_unset(tmp_path: Path):
+    """A single-drive setup keeps working with no data_dir at all."""
+
+    path = tmp_path / "shrink.toml"
+    path.write_text("[run]\nwork_dir = 'state'\n", encoding="utf-8")
+    cfg = load_config(path)
+    assert cfg.run["data_dir"] == cfg.run["work_dir"] == str((tmp_path / "state").resolve())
+
+
+def test_data_dir_is_separate_from_work_dir_when_set(tmp_path: Path):
+    """Credentials stay in work_dir; the bulk data goes wherever data_dir says."""
+
+    data = tmp_path / "elsewhere" / "takeout-work"
+    path = tmp_path / "shrink.toml"
+    path.write_text(f"[run]\nwork_dir = 'state'\ndata_dir = '{data.as_posix()}'\n", encoding="utf-8")
+    cfg = load_config(path)
+    assert cfg.run["work_dir"] == str((tmp_path / "state").resolve())
+    assert cfg.run["data_dir"] == str(data.resolve())
+
+
+def test_a_relative_data_dir_resolves_against_the_config_file(tmp_path: Path):
+    path = tmp_path / "shrink.toml"
+    path.write_text("[run]\ndata_dir = 'bulk'\n", encoding="utf-8")
+    assert load_config(path).run["data_dir"] == str((tmp_path / "bulk").resolve())
+
+
+def test_data_dir_does_not_change_the_encoding_fingerprint(tmp_path: Path):
+    """Moving where outputs live must not mark every existing output stale."""
+
+    path = tmp_path / "shrink.toml"
+    path.write_text("", encoding="utf-8")
+    original = load_config(path).fingerprint
+    path.write_text("[run]\ndata_dir = 'G:/somewhere-else'\n", encoding="utf-8")
+    assert load_config(path).fingerprint == original

@@ -107,7 +107,7 @@ def main() -> int:
     parser = argparse.ArgumentParser(description="Encode a Takeout export, resumably")
     parser.add_argument("root", type=Path, help="Extracted Takeout root")
     parser.add_argument("--limit", type=int, default=0, help="0 encodes everything")
-    parser.add_argument("--work", type=Path, default=None, help="Defaults to run.work_dir")
+    parser.add_argument("--work", type=Path, default=None, help="Defaults to run.data_dir")
     parser.add_argument("--config", default="shrink.toml")
     parser.add_argument(
         "--kinds",
@@ -122,16 +122,16 @@ def main() -> int:
     config = load_config(args.config)
     settings = config.as_dict()
     minimum_savings = float(config.run.get("minimum_savings_percent", 0))
-    work = args.work or Path(config.run["work_dir"])
+    work = args.work or Path(config.run["data_dir"])
     target_dir = work / "out"
     target_dir.mkdir(parents=True, exist_ok=True)
     report_path = args.report or work / "encoded.csv"
     ffprobe = config.tools["ffprobe"]
 
-    # Say where this run reads and writes before doing anything. work_dir
-    # defaults to the repo's .photos-shrink, and a run that meant to resume a
-    # library encoded elsewhere will find no outputs there and quietly start
-    # over -- two hours of re-encoding, with nothing on screen to show it.
+    # Say where this run reads and writes before doing anything. A run aimed
+    # at the wrong directory finds no outputs, concludes nothing was encoded,
+    # and quietly starts over -- once, two hours of re-encoding with nothing on
+    # screen to show it. "(0 already there)" on a resume is the tell.
     existing = sum(1 for _ in target_dir.iterdir()) if target_dir.is_dir() else 0
     print(f"  outputs: {target_dir}  ({existing:,} already there)", flush=True)
     print(f"  report : {report_path}", flush=True)

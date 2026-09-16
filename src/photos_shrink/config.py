@@ -27,7 +27,7 @@ DEFAULTS: dict[str, dict[str, Any]] = {
     "google": {"cookies_file": ".photos-shrink/cookies.txt", "browser_profile": ".photos-shrink/browser",
                "browser_channel": "chrome", "browser_headless": True, "account_index": 0,
                "session_refresh_seconds": 300},
-    "run": {"work_dir": ".photos-shrink", "pause_seconds": 10, "minimum_savings_percent": 20,
+    "run": {"work_dir": ".photos-shrink", "data_dir": "", "pause_seconds": 10, "minimum_savings_percent": 20,
             "threads": 2, "skip_shared": True, "skip_non_space_consuming": True,
             "photos_only": False},
     "exclude": {"timezone": "America/New_York", "date_ranges": [], "name_globs": []},
@@ -169,6 +169,22 @@ def load_config(path: str | os.PathLike[str] = "shrink.toml") -> Settings:
             if not candidate.is_absolute():
                 candidate = path.parent / candidate
             values[section][key] = str(candidate.resolve())
+    # work_dir holds private credentials and belongs beside the repo; data_dir
+    # holds the bulk Takeout work -- outputs, reports, the upload journal --
+    # which is gigabytes and usually lives on another drive. They were one
+    # setting, so every data default pointed into the repo: an encode meant to
+    # resume a library on G: re-encoded all of it into .photos-shrink instead.
+    # Unset, data_dir falls back to work_dir, so a single-drive setup is unchanged.
+    data_dir = values["run"]["data_dir"]
+    if not isinstance(data_dir, str):
+        raise ConfigError("run.data_dir must be a path")
+    if data_dir.strip():
+        candidate = Path(data_dir).expanduser()
+        if not candidate.is_absolute():
+            candidate = path.parent / candidate
+        values["run"]["data_dir"] = str(candidate.resolve())
+    else:
+        values["run"]["data_dir"] = values["run"]["work_dir"]
     for key in ("ffmpeg", "ffprobe"):
         tool = Path(str(values["tools"][key])).expanduser()
         if tool.is_absolute() or len(tool.parts) > 1:

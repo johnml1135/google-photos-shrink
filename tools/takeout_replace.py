@@ -52,8 +52,8 @@ def main() -> int:
     journal = UploadJournal.load(args.journal)
 
     settings = load_config(args.config)
-    work_dir = Path(settings.run["work_dir"])
-    mirror_path = args.mirror or work_dir / "mirror.csv"
+    data_dir = Path(settings.run["data_dir"])
+    mirror_path = args.mirror or data_dir / "mirror.csv"
     mirror_keys = _load_mirror_keys(mirror_path)
 
     todo = journal.pending_replacement()

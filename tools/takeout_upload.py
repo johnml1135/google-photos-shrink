@@ -17,8 +17,9 @@ import sys
 import time
 from pathlib import Path
 
-from photos_shrink import media, takeout
+from photos_shrink import media
 from photos_shrink.config import load_config
+from photos_shrink.integrity import sha256_file
 from photos_shrink.ledger import UploadJournal, UploadRecord
 from photos_shrink.photos_api import (
     PhotosApiClient,
@@ -60,7 +61,7 @@ def verify_item(item: dict, source: Path, ffprobe: str) -> tuple[str, str]:
 
 def main() -> int:
     parser = argparse.ArgumentParser(description="Upload encoded replacements via the Photos API")
-    parser.add_argument("--report", type=Path, default=None, help="Defaults to <work_dir>/encoded.csv")
+    parser.add_argument("--report", type=Path, default=None, help="Defaults to <data_dir>/encoded.csv")
     parser.add_argument("--config", default="shrink.toml")
     parser.add_argument("--limit", type=int, default=0, help="0 uploads every encoded row")
     parser.add_argument("--album", default=None, help="Create/use an album for the replacements")
@@ -78,7 +79,7 @@ def main() -> int:
     work_dir = Path(settings.run["work_dir"])
     ffprobe = settings.tools["ffprobe"]
     if args.report is None:
-        args.report = work_dir / "encoded.csv"
+        args.report = Path(settings.run["data_dir"]) / "encoded.csv"
     if not args.report.exists():
         print(f"No encode report at {args.report}. Run tools/takeout_encode.py first.", file=sys.stderr)
         return 2
@@ -153,7 +154,7 @@ def main() -> int:
             failed += 1
             continue
 
-        local_sha = takeout.sha256(output)
+        local_sha = sha256_file(output)
         try:
             item = api.upload(output, album_id=album_id)
         except PhotosApiError as exc:

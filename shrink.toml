@@ -54,7 +54,16 @@ account_index = 1
 session_refresh_seconds = 300
 
 [run]
+# Two different kinds of thing, deliberately kept in two places:
+#   work_dir  private credentials -- cookies, the API token and client. Small,
+#             never leaves this machine, belongs beside the repo.
+#   data_dir  the Takeout work -- encoded outputs, encoded.csv, mirror.csv and
+#             the upload journal. Gigabytes; lives wherever the export does.
+# When they were one setting, every data default pointed into the repo, and an
+# encode meant to resume the library on G: re-encoded all of it here instead.
+# Leave data_dir empty to keep both in work_dir.
 work_dir = ".photos-shrink"
+data_dir = "G:/takeout-work"
 pause_seconds = 10
 minimum_savings_percent = 20
 threads = 2
