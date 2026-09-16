@@ -219,8 +219,14 @@ def probe(path: str | os.PathLike[str], ffprobe: str = "ffprobe") -> dict[str, A
             "skip_reason": "unsupported or unreadable media",
         }
     streams = data.get("streams") or []
+    # A cover thumbnail is reported as a video stream with attached_pic set.
+    # Counting it as a second video track rejected whole camera clips over an
+    # embedded still that `-map 0:v:0` was never going to copy anyway.
     video_streams = [
-        stream for stream in streams if stream.get("codec_type") == "video"
+        stream
+        for stream in streams
+        if stream.get("codec_type") == "video"
+        and not (stream.get("disposition") or {}).get("attached_pic")
     ]
     video = next(
         iter(video_streams), None
@@ -254,10 +260,17 @@ def probe(path: str | os.PathLike[str], ffprobe: str = "ffprobe") -> dict[str, A
     audio_streams = [
         stream for stream in streams if stream.get("codec_type") == "audio"
     ]
+    # `data` is deliberately not here. Phones attach timecode and motion
+    # metadata tracks to ordinary clips -- an iPhone .MOV carries three -- and
+    # treating those as content rejected the video outright. They are not
+    # something a viewer sees, they do not survive a re-encode anywhere, and
+    # the ffmpeg command maps only the first video and audio stream, so they
+    # were already being dropped rather than silently mangled. Subtitles and
+    # attachments stay: those a viewer would miss.
     extra_streams = [
         stream
         for stream in streams
-        if stream.get("codec_type") in {"subtitle", "data", "attachment"}
+        if stream.get("codec_type") in {"subtitle", "attachment"}
     ]
     if skip_reason is None:
         if duration is None:

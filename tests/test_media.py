@@ -427,3 +427,105 @@ def test_probe_still_rejects_an_out_of_range_orientation(tmp_path: Path) -> None
     exif[274] = 99
     pil.new("RGB", (60, 40), "blue").save(source, exif=exif)
     assert probe(source)["skip_reason"] == "malformed EXIF orientation metadata"
+
+
+def _camera_clip(extra_streams: list[dict]) -> dict:
+    """An ordinary single-camera clip, plus whatever streams a test adds."""
+
+    return {
+        "streams": [
+            {"codec_type": "video", "width": 1920, "height": 1080, "codec_name": "h264",
+             "duration": "10", "avg_frame_rate": "30/1"},
+            {"codec_type": "audio", "codec_name": "aac", "channels": 2},
+            *extra_streams,
+        ],
+        "format": {"format_name": "mov,mp4,m4a,3gp,3g2,mj2", "duration": "10"},
+    }
+
+
+def test_probe_accepts_a_phone_clip_carrying_metadata_tracks(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An iPhone .MOV ships timecode and motion tracks alongside the picture.
+
+    Treating those as content rejected whole camera clips. They are not
+    something a viewer sees, and the encoder maps only the first video and
+    audio stream, so they were already being dropped rather than mangled.
+    """
+
+    import photos_shrink.media as media_module
+
+    source = tmp_path / "IMG_3564.MOV"
+    source.write_bytes(b"fixture")
+    monkeypatch.setattr(
+        media_module, "_ffprobe_json",
+        lambda path, ffprobe: _camera_clip([{"codec_type": "data"}] * 3),
+    )
+
+    result = media_module.probe(source)
+
+    assert result["skip_reason"] is None
+    assert result["kind"] == "video"
+    assert result["has_audio"] is True
+
+
+def test_probe_still_rejects_a_real_second_audio_track(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Dropping the data-stream check must not drop the audio check with it."""
+
+    import photos_shrink.media as media_module
+
+    source = tmp_path / "dubbed.mp4"
+    source.write_bytes(b"fixture")
+    monkeypatch.setattr(
+        media_module, "_ffprobe_json",
+        lambda path, ffprobe: _camera_clip([{"codec_type": "audio", "codec_name": "aac"}]),
+    )
+
+    assert media_module.probe(source)["skip_reason"] == (
+        "multiple audio tracks or subtitles are unsupported"
+    )
+
+
+def test_probe_still_rejects_subtitles(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A subtitle track is content a viewer would miss, so it still refuses."""
+
+    import photos_shrink.media as media_module
+
+    source = tmp_path / "subtitled.mp4"
+    source.write_bytes(b"fixture")
+    monkeypatch.setattr(
+        media_module, "_ffprobe_json",
+        lambda path, ffprobe: _camera_clip([{"codec_type": "subtitle", "codec_name": "mov_text"}]),
+    )
+
+    assert media_module.probe(source)["skip_reason"] == (
+        "multiple audio tracks or subtitles are unsupported"
+    )
+
+
+def test_probe_ignores_an_embedded_cover_thumbnail(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A cover still is reported as a video stream with attached_pic set.
+
+    Counting it as a second video track rejected a 460 MB clip over an
+    embedded thumbnail `-map 0:v:0` would never have copied.
+    """
+
+    import photos_shrink.media as media_module
+
+    source = tmp_path / "Hilton Head.MOV"
+    source.write_bytes(b"fixture")
+    cover = {"codec_type": "video", "codec_name": "mjpeg", "width": 480, "height": 270,
+             "disposition": {"attached_pic": 1}}
+    monkeypatch.setattr(media_module, "_ffprobe_json", lambda path, ffprobe: _camera_clip([cover]))
+
+    result = media_module.probe(source)
+
+    assert result["skip_reason"] is None
+    # The picture, not the thumbnail, decides the output dimensions.
+    assert (result["width"], result["height"]) == (1920, 1080)
