@@ -45,6 +45,8 @@ class FakeLibrary:
     items: dict[str, dict[str, Any]] = field(default_factory=dict)
     verify_error: Exception | None = None
     trash_confirms: bool = True
+    require_trust: bool = False
+    trusted: set[str] = field(default_factory=set)
     calls: list[tuple] = field(default_factory=list)
 
     def find_uploaded(self, path):
@@ -57,11 +59,19 @@ class FakeLibrary:
         self.calls.append(("get_item", media_key, result))
         return result
 
+    def trust_replacement(self, media_key):
+        self.calls.append(("trust_replacement", media_key))
+        self.trusted.add(media_key)
+
     def restore_metadata(self, original, replacement):
         self.calls.append(("restore_metadata", original.get("id"), replacement.get("id")))
 
     def verify_replacement(self, original, replacement, info):
         self.calls.append(("verify_replacement", original.get("id"), replacement.get("id")))
+        if self.require_trust and replacement.get("id") not in self.trusted:
+            # What the live session did: an API upload's ownership is not
+            # readable over the web client, so it is refused unless trusted.
+            raise RuntimeError("replacement has an unsafe metadata state")
         if self.verify_error is not None:
             raise self.verify_error
 
@@ -295,6 +305,7 @@ class TestReplaceOneOrder:
             "find_uploaded",
             "get_item",
             "find_uploaded",
+            "trust_replacement",
             "restore_metadata",
             "verify_replacement",
         ]
@@ -333,6 +344,7 @@ class TestReplaceOneOrder:
             "find_uploaded",
             "get_item",
             "find_uploaded",
+            "trust_replacement",
             "restore_metadata",
             "verify_replacement",
             "trash",
@@ -355,3 +367,78 @@ class TestReplaceOneOrder:
         assert "verify_replacement" in library.names()
         assert "trash" not in library.names()
         assert "is_trashed" not in library.names()
+
+
+class TestReplacementTrust:
+    """The replacement is trusted on its receipt, and only on its receipt.
+
+    The live cookie session cannot read ownership for an item uploaded through
+    the official API, and refuses it as "ownership is unknown". Its first live
+    run failed every replacement that way. Trust is what resolves that -- so it
+    has to be granted exactly when the receipt is complete, never earlier.
+    """
+
+    def _library(self, original, replacement, **kw):
+        return FakeLibrary(
+            by_hash={"IMG_1.jpg": original, "out.avif": replacement},
+            items={original["id"]: original},
+            **kw,
+        )
+
+    def test_an_api_upload_replaces_once_it_is_trusted(self, tmp_path, monkeypatch):
+        """The live failure, reproduced: without trust this raised."""
+
+        patch_probe(monkeypatch)
+        library = self._library(make_item("KEY1"), make_item("REPL1"), require_trust=True)
+        outcome = replace_one(library, make_job(tmp_path, media_key="KEY1"),
+                              settings=settings_for(tmp_path), ffprobe="ffprobe",
+                              apply=True, keep_originals=False)
+        assert outcome.status == "replaced"
+        assert library.trusted == {"REPL1"}
+
+    def test_trust_comes_after_the_receipt_and_before_any_mutation(self, tmp_path, monkeypatch):
+        patch_probe(monkeypatch)
+        library = self._library(make_item("KEY1"), make_item("REPL1"))
+        replace_one(library, make_job(tmp_path, media_key="KEY1"),
+                    settings=settings_for(tmp_path), ffprobe="ffprobe",
+                    apply=True, keep_originals=False)
+        names = library.names()
+        assert names.index("trust_replacement") > names.index("find_uploaded", 1)
+        assert names.index("trust_replacement") < names.index("restore_metadata")
+
+    def test_only_the_replacement_is_trusted_never_the_original(self, tmp_path, monkeypatch):
+        patch_probe(monkeypatch)
+        library = self._library(make_item("KEY1"), make_item("REPL1"))
+        replace_one(library, make_job(tmp_path, media_key="KEY1"),
+                    settings=settings_for(tmp_path), ffprobe="ffprobe",
+                    apply=True, keep_originals=False)
+        assert "KEY1" not in library.trusted
+
+    def test_nothing_is_trusted_in_a_dry_run(self, tmp_path, monkeypatch):
+        patch_probe(monkeypatch)
+        library = self._library(make_item("KEY1"), make_item("REPL1"))
+        replace_one(library, make_job(tmp_path, media_key="KEY1"),
+                    settings=settings_for(tmp_path), ffprobe="ffprobe",
+                    apply=False, keep_originals=False)
+        assert "trust_replacement" not in library.names()
+
+    def test_nothing_is_trusted_when_the_encoded_file_no_longer_matches_the_upload(self, tmp_path, monkeypatch):
+        """No complete receipt, no trust -- and nothing restored either."""
+
+        patch_probe(monkeypatch)
+        library = self._library(make_item("KEY1"), make_item("REPL1"))
+        job = make_job(tmp_path, media_key="KEY1", output_sha256="0" * 64)
+        with pytest.raises(ReplaceError, match="no longer matches"):
+            replace_one(library, job, settings=settings_for(tmp_path), ffprobe="ffprobe",
+                        apply=True, keep_originals=False)
+        assert "trust_replacement" not in library.names()
+        assert "restore_metadata" not in library.names()
+
+    def test_nothing_is_trusted_when_the_gate_refuses(self, tmp_path, monkeypatch):
+        patch_probe(monkeypatch)
+        library = self._library(make_item("KEY1", space_taken_bytes=0), make_item("REPL1"))
+        outcome = replace_one(library, make_job(tmp_path, media_key="KEY1"),
+                              settings=settings_for(tmp_path), ffprobe="ffprobe",
+                              apply=True, keep_originals=False)
+        assert outcome.status == "refused"
+        assert "trust_replacement" not in library.names()

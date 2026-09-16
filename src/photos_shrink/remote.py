@@ -448,6 +448,24 @@ class GooglePhotosRemote:
         return all(math.isclose(a, b, rel_tol=0.0, abs_tol=1e-7) for a, b in zip(left, right))
 
 
+    def trust_replacement(self, media_key: str) -> None:
+        """Vouch for the ownership of a replacement this tool uploaded.
+
+        The web client cannot read ownership for an item created through the
+        official API, so `_convert_item` marks it "ownership is unknown" and
+        every replacement fails verification -- which is exactly what the first
+        live run did. The caller grants trust only once the receipt is
+        complete: the item resolved by the exact content hash of the file that
+        was encoded and uploaded.
+
+        Trust resolves only the unknown case. An item known not to be owned, or
+        in a shared album, is still refused.
+        """
+
+        if not isinstance(media_key, str) or not media_key:
+            raise RemoteProtocolError("cannot trust a replacement without a media key")
+        self._trusted_media.add(media_key)
+
     def get_item(self, id: str) -> dict[str, Any]:
         self._load_dependencies()
         if not isinstance(id, str) or not id:

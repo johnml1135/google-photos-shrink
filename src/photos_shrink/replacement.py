@@ -174,6 +174,12 @@ def replace_one(
         )
 
     info = output_info_for(job, job.output, ffprobe)
+    # The receipt is now complete: the file on disk is the one whose hash was
+    # recorded at upload, and the library holds an item with exactly those
+    # bytes. That is proof this replacement is ours, which the web client cannot
+    # read for an API upload -- so vouch for it before anything is restored or
+    # verified. Never earlier: without a full receipt nothing is trusted.
+    library.trust_replacement(str(replacement["id"]))
     library.restore_metadata(original, replacement)
     library.verify_replacement(original, replacement, info)
 

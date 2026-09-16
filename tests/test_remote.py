@@ -510,7 +510,7 @@ def test_trusted_upload_with_missing_source_is_safe(tmp_path):
     remote = GooglePhotosRemote({"run": {"skip_shared": False}}, payloads=Payloads, client=Client())
     info, ext, library_item = _shared_album_item()
     ext.source = []
-    remote._trusted_media.add("media")
+    remote.trust_replacement("media")
 
     item = remote._convert_item(info, ext, library_item)
 
@@ -1112,3 +1112,41 @@ class TestRequireMatching:
 
     def test_no_keys_is_vacuously_true(self):
         GooglePhotosRemote._require_matching({}, {}, (), "{key} changed")
+
+
+class TestTrustReplacement:
+    """Trust resolves "ownership is unknown" and nothing stronger."""
+
+    def _remote(self):
+        return GooglePhotosRemote({"run": {"skip_shared": False}}, payloads=Payloads, client=Client())
+
+    def test_an_unreadable_owner_is_unknown_until_trusted(self):
+        """The live failure: an API upload's ownership is not readable."""
+
+        remote = self._remote()
+        info, ext, library_item = _shared_album_item()
+        library_item.is_owned = None
+        assert remote._convert_item(info, ext, library_item)["skip_reason"] == "ownership is unknown"
+
+        remote.trust_replacement("media")
+        assert remote._convert_item(info, ext, library_item)["skip_reason"] is None
+
+    def test_trust_never_overrides_a_known_other_owner(self):
+        """Vouching for an item cannot make someone else's photo deletable."""
+
+        remote = self._remote()
+        info, ext, library_item = _shared_album_item()
+        library_item.is_owned = False
+        remote.trust_replacement("media")
+        assert remote._convert_item(info, ext, library_item)["skip_reason"]
+
+    def test_trust_is_per_item(self):
+        remote = self._remote()
+        info, ext, library_item = _shared_album_item()
+        library_item.is_owned = None
+        remote.trust_replacement("some-other-item")
+        assert remote._convert_item(info, ext, library_item)["skip_reason"] == "ownership is unknown"
+
+    def test_an_empty_key_is_refused(self):
+        with pytest.raises(RemoteProtocolError):
+            self._remote().trust_replacement("")
