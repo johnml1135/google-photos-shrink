@@ -4,10 +4,39 @@ format = "avif"
 quality = 60
 
 [videos]
+# Videos are ~2% of a library's items and ~45% of its encoded bytes, so this
+# block decides the total more than anything in [photos] does.
+#
+# Measured on five real clips from this library, 15s each, as a share of the
+# 1.84 GB the 174 videos occupy at the settings below. x265's own default CRF
+# is 28 (x264's is 23 -- they are not the same scale), and +6 CRF roughly
+# halves the size.
+#
+#   long_edge/short_edge   crf    videos    whole library
+#   1920/1080               28    1.84 GB      4.14 GB   x265 default
+#   1920/1080               30    1.32 GB      3.62 GB   <- chosen
+#   1920/1080               32    0.95 GB      3.25 GB
+#   1280/720                28    0.92 GB      3.22 GB
+#   1280/720                30    0.67 GB      2.97 GB
+#    720/480                28    0.39 GB      2.69 GB   DVD, standard definition
+#
+# 1080p/32 and 720p/28 cost the same bytes; they differ in how those bytes are
+# spent. For handheld phone footage the 720p side tends to look better, because
+# downscaling averages away the sensor noise that coarse quantisation turns
+# into blocking on a fast pan.
+#
+# 30 is chosen as the free win: it keeps HD, sits inside the 25-30 "balanced"
+# band the x265 guides recommend for 1080p, and saves half a gigabyte. Dropping
+# to DVD would save 1.45 GB more but takes every video to standard definition
+# permanently -- it moves the whole library from 83.5% saved to 89.3%, which is
+# a poor trade for footage whose originals you intend to delete.
+#
+# Changing crf or the edges makes existing video outputs stale. Re-encode just
+# those with:  tools/takeout_encode.py <root> --kinds video --no-resume
 long_edge = 1920
 short_edge = 1080
 codec = "hevc"
-crf = 28
+crf = 30
 preset = "slow"
 max_fps = 0
 audio_bitrate_kbps = 96

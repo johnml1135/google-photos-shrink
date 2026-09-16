@@ -56,6 +56,21 @@ def output_path(entry: takeout.MirrorEntry, target_dir: Path) -> Path:
     return target_dir / f"{entry.path.stem}-{(entry.media_key or '')[3:15]}{suffix}"
 
 
+def carried_rows(path: Path, covered: set[str]) -> list[dict]:
+    """Rows in an existing report that this run will not rewrite.
+
+    A run narrowed with --kinds or --limit only builds rows for what it
+    touched. Writing just those would drop every other row from the report --
+    so re-encoding videos would silently delete the photo rows the uploader
+    reads, and with them the record of ten thousand encodes.
+    """
+
+    if not path.is_file():
+        return []
+    with open(path, newline="", encoding="utf-8") as handle:
+        return [row for row in csv.DictReader(handle) if row.get("source") not in covered]
+
+
 def write_report(path: Path, rows: list[dict]) -> None:
     tmp = path.with_suffix(path.suffix + ".tmp")
     with open(tmp, "w", newline="", encoding="utf-8") as handle:
@@ -107,6 +122,12 @@ def main() -> int:
     # if a long video pass is interrupted later.
     entries.sort(key=lambda e: (e.kind != "photo", -e.size_bytes))
     print(f"  {len(entries):,} candidate item(s)", flush=True)
+
+    # Read once, before anything is written, so the rows this run is not
+    # responsible for survive it.
+    carried = carried_rows(report_path, {str(e.path) for e in entries})
+    if carried:
+        print(f"  {len(carried):,} row(s) carried from the existing report", flush=True)
 
     rows: list[dict] = []
     encoded = reused = skipped = 0
@@ -201,9 +222,9 @@ def main() -> int:
                 flush=True,
             )
         if len(rows) % FLUSH_EVERY == 0:
-            write_report(report_path, rows)
+            write_report(report_path, carried + rows)
 
-    write_report(report_path, rows)
+    write_report(report_path, carried + rows)
     print(f"\n--- encoded {encoded:,}, reused {reused:,}, skipped {skipped:,} ---", flush=True)
     if total_old:
         saved = total_old - total_new
