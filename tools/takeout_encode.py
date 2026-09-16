@@ -56,6 +56,32 @@ def output_path(entry: takeout.MirrorEntry, target_dir: Path) -> Path:
     return target_dir / f"{entry.path.stem}-{(entry.media_key or '')[3:15]}{suffix}"
 
 
+def encode_into_place(source: Path, output: Path, settings: dict) -> dict:
+    """Encode `source`, and put a file at `output` only once it has verified.
+
+    The encoder used to write straight to the final name. A run killed for low
+    memory partway through a 460 MB video left a truncated file there -- and a
+    resume treats any non-empty file at that name as finished work, skipping
+    encode and verify alike. A failed verify stranded its output the same way.
+
+    So the work happens under a `.partial` name and is moved into place only
+    after `media.verify` passes. A crash that no handler survives still cannot
+    leave anything under the final name, and a failed re-encode leaves the
+    previous good output exactly as it was.
+    """
+
+    partial = output.with_name(f"{output.stem}.partial{output.suffix}")
+    partial.unlink(missing_ok=True)   # a leftover from a run that was killed
+    try:
+        info = media.encode(source, partial, settings)
+        media.verify(source, partial, settings)
+    except BaseException:
+        partial.unlink(missing_ok=True)
+        raise
+    partial.replace(output)
+    return info
+
+
 def load_report(path: Path) -> list[dict]:
     """Every row of an existing report, in order; empty when there is none."""
 
@@ -188,8 +214,7 @@ def main() -> int:
                         "latitude": entry.latitude,
                         "longitude": entry.longitude,
                     }
-                info = media.encode(entry.path, output, encode_settings)
-                media.verify(entry.path, output, encode_settings)
+                info = encode_into_place(entry.path, output, encode_settings)
             source_info = media.probe(entry.path, ffprobe)
         except Exception as exc:  # noqa: BLE001 - every outcome is recorded
             row.update(status="skipped", reason=f"{type(exc).__name__}: {exc}")

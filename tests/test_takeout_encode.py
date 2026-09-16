@@ -17,6 +17,8 @@ import importlib.util
 import sys
 from pathlib import Path
 
+import pytest
+
 MODULE = Path(__file__).resolve().parents[1] / "tools" / "takeout_encode.py"
 spec = importlib.util.spec_from_file_location("takeout_encode", MODULE)
 takeout_encode = importlib.util.module_from_spec(spec)
@@ -110,3 +112,80 @@ class TestReportRoundTrip:
 
     def test_a_report_that_does_not_exist_loads_empty(self, tmp_path):
         assert takeout_encode.load_report(tmp_path / "absent.csv") == []
+
+
+class TestEncodeIntoPlace:
+    """Nothing lands under the final name until it has verified.
+
+    A run killed for low memory left a truncated 460 MB video under its final
+    name, which a resume would have treated as finished work.
+    """
+
+    def _fake(self, monkeypatch, *, encode_error=None, verify_error=None):
+        def encode(source, destination, settings):
+            if encode_error:
+                Path(destination).write_bytes(b"half a vid")   # a partial write
+                raise encode_error
+            Path(destination).write_bytes(b"whole video")
+            return {"kind": "video"}
+
+        def verify(source, output, settings):
+            if verify_error:
+                raise verify_error
+
+        monkeypatch.setattr(takeout_encode.media, "encode", encode)
+        monkeypatch.setattr(takeout_encode.media, "verify", verify)
+
+    def test_a_verified_encode_lands_under_the_final_name(self, tmp_path, monkeypatch):
+        self._fake(monkeypatch)
+        output = tmp_path / "clip.mp4"
+        takeout_encode.encode_into_place(tmp_path / "src.mov", output, {})
+        assert output.read_bytes() == b"whole video"
+        assert list(tmp_path.glob("*.partial.*")) == []
+
+    def test_a_failed_encode_leaves_nothing_under_the_final_name(self, tmp_path, monkeypatch):
+        self._fake(monkeypatch, encode_error=RuntimeError("ffmpeg died"))
+        output = tmp_path / "clip.mp4"
+        with pytest.raises(RuntimeError):
+            takeout_encode.encode_into_place(tmp_path / "src.mov", output, {})
+        assert not output.exists()
+        assert list(tmp_path.glob("*.partial.*")) == []
+
+    def test_a_failed_verify_leaves_nothing_under_the_final_name(self, tmp_path, monkeypatch):
+        """This used to strand an unverified file that a resume would reuse."""
+
+        self._fake(monkeypatch, verify_error=RuntimeError("duration was not preserved"))
+        output = tmp_path / "clip.mp4"
+        with pytest.raises(RuntimeError):
+            takeout_encode.encode_into_place(tmp_path / "src.mov", output, {})
+        assert not output.exists()
+
+    def test_a_failed_re_encode_keeps_the_previous_good_output(self, tmp_path, monkeypatch):
+        """--no-resume must not destroy a good output when its redo fails."""
+
+        output = tmp_path / "clip.mp4"
+        output.write_bytes(b"previous good")
+        self._fake(monkeypatch, encode_error=RuntimeError("killed"))
+        with pytest.raises(RuntimeError):
+            takeout_encode.encode_into_place(tmp_path / "src.mov", output, {})
+        assert output.read_bytes() == b"previous good"
+
+    def test_a_partial_left_by_a_killed_run_is_never_mistaken_for_output(self, tmp_path, monkeypatch):
+        """A hard kill runs no cleanup; the leftover must not sit at the final name."""
+
+        (tmp_path / "clip.partial.mp4").write_bytes(b"truncated by the OOM killer")
+        self._fake(monkeypatch)
+        output = tmp_path / "clip.mp4"
+        takeout_encode.encode_into_place(tmp_path / "src.mov", output, {})
+        assert output.read_bytes() == b"whole video"
+        assert not (tmp_path / "clip.partial.mp4").exists()
+
+    def test_the_extension_survives_so_the_format_is_still_chosen_correctly(self, tmp_path, monkeypatch):
+        """PIL and ffmpeg pick the container from the suffix."""
+
+        seen = []
+        monkeypatch.setattr(takeout_encode.media, "encode",
+                            lambda s, d, c: (seen.append(Path(d).suffix), Path(d).write_bytes(b"x"))[1] or {})
+        monkeypatch.setattr(takeout_encode.media, "verify", lambda *a: None)
+        takeout_encode.encode_into_place(tmp_path / "a.jpg", tmp_path / "a.avif", {})
+        assert seen == [".avif"]
