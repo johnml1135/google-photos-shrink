@@ -534,6 +534,22 @@ def test_probe_ignores_an_embedded_cover_thumbnail(
     assert (result["width"], result["height"]) == (1920, 1080)
 
 
+DRIBBLE = (
+    "import sys, time\n"
+    "for _ in range(30):\n"
+    "    sys.stderr.write('x'); sys.stderr.flush()\n"
+    "    time.sleep(0.2)\n"
+)
+
+# ffmpeg reports a frame counter several times a second while it encodes.
+FRAMES = (
+    "import time\n"
+    "for i in range(%d):\n"
+    "    print('frame=%%d' %% i, flush=True)\n"
+    "    time.sleep(0.05)\n"
+)
+
+
 class TestRunFfmpeg:
     """A wedged encode must cost its own item, never the run.
 
@@ -551,45 +567,30 @@ class TestRunFfmpeg:
         with pytest.raises(media.MediaError, match="video encoding failed"):
             media.run_ffmpeg(self._python("import sys; sys.stderr.write('bad input'); sys.exit(1)"), timeout=60)
 
-    def test_a_command_that_writes_nothing_is_abandoned(self, tmp_path):
-        """The live failure: ffmpeg held the file open and wrote nothing for hours."""
+    def test_a_command_that_reports_no_progress_is_abandoned(self):
+        """The live failure: ffmpeg stopped encoding but held the file open."""
 
-        output = tmp_path / "out.mp4"
-        output.write_bytes(b"header")
         started = time.monotonic()
-        with pytest.raises(media.MediaError, match="wrote nothing for"):
+        with pytest.raises(media.MediaError, match="reported no progress for"):
             media.run_ffmpeg(self._python("import time; time.sleep(30)"), timeout=600,
-                             output=output, stall_seconds=1, poll_seconds=0.2)
+                             stall_seconds=1, poll_seconds=0.2)
         assert time.monotonic() - started < 15
 
-    def test_a_growing_output_is_left_alone(self, tmp_path):
-        """A long encode must not be cut off for being long."""
+    def test_a_dribble_of_output_is_not_progress(self):
+        """What fooled the first watchdog: a wedged encode still flushes bytes."""
 
-        output = tmp_path / "out.mp4"
-        script = (
-            "import pathlib, time\n"
-            f"p = pathlib.Path(r'{output}')\n"
-            "for i in range(6):\n"
-            "    p.write_bytes(b'x' * (i + 1) * 100)\n"
-            "    time.sleep(0.2)\n"
-        )
-        media.run_ffmpeg(self._python(script), timeout=600, output=output,
-                         stall_seconds=1, poll_seconds=0.1)
-        assert output.stat().st_size == 600
+        script = DRIBBLE
+        with pytest.raises(media.MediaError, match="reported no progress for"):
+            media.run_ffmpeg(self._python(script), timeout=600, stall_seconds=1, poll_seconds=0.2)
 
-    def test_the_outer_timeout_still_bounds_a_growing_encode(self, tmp_path):
-        output = tmp_path / "out.mp4"
-        script = (
-            "import pathlib, time\n"
-            f"p = pathlib.Path(r'{output}')\n"
-            "for i in range(200):\n"
-            "    p.write_bytes(b'x' * (i + 1))\n"
-            "    time.sleep(0.1)\n"
-        )
+    def test_a_reported_frame_counter_keeps_it_alive(self):
+        """A long encode must not be cut off while ffmpeg says it is working."""
+
+        media.run_ffmpeg(self._python(FRAMES % 12), timeout=600, stall_seconds=1, poll_seconds=0.1)
+
+    def test_the_outer_timeout_still_bounds_a_working_encode(self):
         with pytest.raises(media.MediaError, match="did not finish within"):
-            media.run_ffmpeg(self._python(script), timeout=1, output=output,
-                             stall_seconds=60, poll_seconds=0.1)
-
+            media.run_ffmpeg(self._python(FRAMES % 400), timeout=1, stall_seconds=60, poll_seconds=0.1)
     def test_the_timeout_scales_with_the_sources_length(self):
         settings = {"videos": {"timeout_factor": 10, "timeout_floor_seconds": 900}}
         assert media.encode_timeout(600, settings) == 6000

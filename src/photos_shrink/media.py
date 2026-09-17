@@ -6,6 +6,7 @@ import json
 import math
 import os
 import subprocess
+import threading
 import time
 from pathlib import Path
 from typing import Any
@@ -407,49 +408,61 @@ def run_ffmpeg(
     command: list[str],
     *,
     timeout: float,
-    output: Path | None = None,
     stall_seconds: float = 300,
     poll_seconds: float = 5,
 ) -> None:
-    """Run ffmpeg, and abandon it when it stops making progress.
+    """Run ffmpeg, and abandon it when it stops encoding.
 
-    One 11-minute MOV in this library wedges ffmpeg: no CPU, nothing written,
-    and it survives a kill. Without a bound that single file stalled a
-    196-video run indefinitely, which is what it did.
+    One 11-minute MOV in this library wedges ffmpeg: it stops burning CPU,
+    ignores a kill, and never finishes. Without a bound, that one file stalled
+    a 196-video run indefinitely.
 
-    Progress is the output file growing, so a long encode is never cut off for
-    being long, while a wedged one is dropped in minutes rather than hours.
-    `timeout` remains an outer bound for a run that grows its file but never
-    finishes. A process that will not die is left to the operating system: the
-    run must lose the file, not the queue.
+    The signal is ffmpeg's own progress stream (`-progress pipe:1`), which
+    reports a frame counter several times a second while it is encoding and
+    goes silent the moment it wedges. The output file is not a usable signal:
+    a wedged encode still dribbles buffered bytes to disk for minutes, which
+    an earlier size-based watchdog read as progress.
+
+    `timeout` remains an outer bound for an encode that reports progress but
+    never ends. A process that will not die is left to the operating system:
+    the run must lose the file, not the queue.
     """
 
-    process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-    started = last_progress = time.monotonic()
-    seen = -1
+    process = subprocess.Popen(
+        command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, bufsize=1
+    )
+    started = time.monotonic()
+    last_progress = [started]
+
+    def watch_progress() -> None:
+        assert process.stdout is not None
+        for line in process.stdout:
+            if line.startswith(("frame=", "out_time_ms=", "progress=")):
+                last_progress[0] = time.monotonic()
+
+    reader = threading.Thread(target=watch_progress, daemon=True)
+    reader.start()
 
     def abandon(why: str) -> MediaError:
         process.kill()
         try:
-            process.communicate(timeout=10)
+            process.wait(timeout=10)
         except subprocess.TimeoutExpired:
             pass
         return MediaError(f"video encoding {why}: {command[-1]}")
 
     while True:
         try:
-            _, stderr = process.communicate(timeout=poll_seconds)
+            process.wait(timeout=poll_seconds)
         except subprocess.TimeoutExpired:
             now = time.monotonic()
-            size = output.stat().st_size if output is not None and output.exists() else -1
-            if size != seen:
-                seen, last_progress = size, now
-            if now - last_progress >= stall_seconds:
-                raise abandon(f"wrote nothing for {stall_seconds:.0f}s") from None
+            if now - last_progress[0] >= stall_seconds:
+                raise abandon(f"reported no progress for {stall_seconds:.0f}s") from None
             if now - started >= timeout:
                 raise abandon(f"did not finish within {timeout:.0f}s") from None
             continue
         break
+    stderr = process.stderr.read() if process.stderr is not None else ""
     if process.returncode != 0:
         raise MediaError(f"video encoding failed ({process.returncode}): {stderr.strip()[:400]}")
 
@@ -489,6 +502,10 @@ def _encode_video(
         _tool(settings, "ffmpeg", "ffmpeg"),
         "-v",
         "error",
+        # The watchdog in run_ffmpeg reads this stream to tell encoding from wedged.
+        "-progress",
+        "pipe:1",
+        "-nostats",
         "-y",
     ]
     if start_seconds is not None:
@@ -539,7 +556,6 @@ def _encode_video(
         run_ffmpeg(
             command,
             timeout=encode_timeout(info.get("duration_seconds"), settings),
-            output=destination,
             stall_seconds=float(options.get("stall_seconds", 300) or 300),
         )
     except MediaError as exc:
