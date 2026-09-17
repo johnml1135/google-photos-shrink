@@ -347,3 +347,32 @@ class TestByteCompatibility:
         record = UploadJournal.load(path).all_records()[0]
         assert record.output == Path("G:/out/a.avif")
         assert record.to_dict()["output"] == str(Path("G:/out/a.avif"))
+
+
+
+class TestCopyRemoval:
+    def _journal(self, tmp_path, **records):
+        journal = UploadJournal(tmp_path / "j.json")
+        for name, values in records.items():
+            journal.record(UploadRecord(output=Path(f"{name}.avif"), verified="ok", **values))
+        return journal
+
+    def test_candidates_are_every_upload_not_replaced_and_not_yet_removed(self, tmp_path):
+        journal = self._journal(
+            tmp_path,
+            pending={},
+            refused={"replaced": "refused: non_space_consuming"},
+            replaced={"replaced": "replaced"},
+            removed={"replaced": "refused: non_space_consuming", "copy_removed_at": "2026-09-17T10:00:00"},
+        )
+        names = sorted(r.output.stem for r in journal.copy_removal_candidates())
+        assert names == ["pending", "refused"]
+
+    def test_a_removed_copy_is_never_pending_replacement(self, tmp_path):
+        journal = self._journal(tmp_path, removed={"copy_removed_at": "2026-09-17T10:00:00"})
+        assert journal.pending_replacement() == []
+
+    def test_the_field_round_trips(self, tmp_path):
+        journal = self._journal(tmp_path, removed={"copy_removed_at": "2026-09-17T10:00:00"})
+        reloaded = UploadJournal.load(journal.path)
+        assert reloaded.all_records()[0].copy_removed_at == "2026-09-17T10:00:00"

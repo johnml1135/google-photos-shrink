@@ -160,6 +160,110 @@ def describe(fixes: dict[str, Any]) -> str:
     return ", ".join(parts)
 
 
+class _Batch:
+    """One batch's jobs and outcomes: the steps replacing and removing share.
+
+    `live` holds the jobs still standing; `fail` records a failure against its
+    own job and drops it, so no later step in the batch touches it.
+    """
+
+    def __init__(self, library: Any, jobs: list[UploadRecord], settings: Settings, progress: Callable[[str], None]):
+        self.library, self.settings, self.progress = library, settings, progress
+        self.jobs = {job.key: job for job in jobs}
+        self.outcomes: dict[str, Outcome] = {}
+        self.live: dict[str, UploadRecord] = {}
+        self.originals: dict[str, dict[str, Any]] = {}
+        self.refused: dict[str, str] = {}
+        self.matches: dict[str, dict[str, str]] = {}
+        self._check_disk(jobs)
+
+    def fail(self, job: UploadRecord, detail: str) -> None:
+        self.outcomes[job.key] = Outcome("failed", detail, job.media_key)
+        self.live.pop(job.key, None)
+
+    def _check_disk(self, jobs: list[UploadRecord]) -> None:
+        """Everything that can be settled on disk, before any request."""
+
+        for job in jobs:
+            if not job.media_key:
+                self.fail(job, "no media key; the original cannot be identified")
+            elif job.source is None or not job.source.is_file():
+                self.fail(job, f"source original is missing from the export: {job.source}")
+            elif job.output is None or not job.output.is_file():
+                self.fail(job, "the encoded output is missing")
+            elif job.output_sha256 and sha256_file(job.output) != job.output_sha256:
+                self.fail(job, "the encoded file on disk no longer matches what was uploaded")
+            else:
+                self.live[job.key] = job
+
+    def read_originals(self) -> None:
+        """Read originals by the sidecar's media key, and set the refused ones aside.
+
+        A refused job leaves `live` for `refused`, with its original kept in
+        `originals`: replacing never touches it, and removing acts only on it.
+        """
+
+        self.progress(f"reading {len(self.live)} original(s)")
+        found = self.library.get_items([job.media_key for job in self.live.values()])
+        for job in list(self.live.values()):
+            item = found.get(job.media_key)
+            if item is None or isinstance(item, Exception):
+                self.fail(job, f"original could not be read: {item or 'no response'}")
+                continue
+            try:
+                check_original(item, job)
+            except ReplaceError as exc:
+                self.fail(job, str(exc))
+                continue
+            self.originals[job.key] = item
+            blocked = refusal(self.settings, item)
+            if blocked:
+                self.refused[job.key] = blocked
+                self.live.pop(job.key)
+
+    def find_replacements(self) -> None:
+        """Resolve each live job's replacement by the content hash of what was uploaded."""
+
+        self.progress(f"finding {len(self.live)} replacement(s)")
+        found = self.library.find_uploaded_many([job.output for job in self.live.values()])
+        for key, job in list(self.live.items()):
+            match = found.get(job.output)
+            if match is None:
+                self.fail(job, "replacement not found by content hash; not guessing")
+            elif isinstance(match, Exception):
+                self.fail(job, f"replacement lookup failed: {match}")
+            else:
+                try:
+                    check_identity(self.originals[key], match)
+                except ReplaceError as exc:
+                    self.fail(job, str(exc))
+                else:
+                    self.matches[key] = match
+
+    def trash_and_confirm(self, dedup_of: Callable[[str], str], status: str, detail: Callable[[str], str]) -> None:
+        """Trash one item per live job in one call, then confirm each in the bin.
+
+        Two jobs can name one library item under different media keys; it
+        shares one dedup key, so it is trashed once and confirms both.
+        """
+
+        if not self.live:
+            return
+        self.progress(f"trashing {len(self.live)} item(s)")
+        try:
+            self.library.trash_many(list(dict.fromkeys(dedup_of(key) for key in self.live)))
+        except Exception as exc:  # noqa: BLE001 - recorded against every job in the call
+            for job in list(self.live.values()):
+                self.fail(job, f"trash failed: {type(exc).__name__}: {exc}")
+            return
+        binned = self.library.in_bin([dedup_of(key) for key in self.live])
+        for key, job in list(self.live.items()):
+            if dedup_of(key) in binned:
+                self.outcomes[key] = Outcome(status, detail(key), job.media_key)
+            else:
+                self.fail(job, "trash was not confirmed by the server")
+
+
 def replace_batch(
     library: Any,
     jobs: list[UploadRecord],
@@ -176,65 +280,22 @@ def replace_batch(
     fake in tests. A failure is recorded against its own job and never stops the rest.
     """
 
-    outcomes: dict[str, Outcome] = {}
-    live: dict[str, UploadRecord] = {}
+    batch = _Batch(library, jobs, settings, progress)
+    live, fail = batch.live, batch.fail
 
-    def fail(job: UploadRecord, detail: str) -> None:
-        outcomes[job.key] = Outcome("failed", detail, job.media_key)
-        live.pop(job.key, None)
+    # 3-4: the originals.
+    batch.read_originals()
+    for key, token in batch.refused.items():
+        batch.outcomes[key] = Outcome("refused", token, batch.jobs[key].media_key)
 
-    # 1-2: everything that can be settled on disk, before any request.
-    for job in jobs:
-        if not job.media_key:
-            outcomes[job.key] = Outcome("failed", "no media key; the original cannot be identified")
-        elif job.source is None or not job.source.is_file():
-            outcomes[job.key] = Outcome("failed", f"source original is missing from the export: {job.source}", job.media_key)
-        elif job.output is None or not job.output.is_file():
-            outcomes[job.key] = Outcome("failed", "the encoded output is missing", job.media_key)
-        elif job.output_sha256 and sha256_file(job.output) != job.output_sha256:
-            outcomes[job.key] = Outcome("failed", "the encoded file on disk no longer matches what was uploaded", job.media_key)
-        else:
-            live[job.key] = job
-
-    # 3-4: the originals, by the sidecar's media key.
-    progress(f"reading {len(live)} original(s)")
-    originals_by_key = library.get_items([job.media_key for job in live.values()])
-    originals: dict[str, dict[str, Any]] = {}
-    for job in list(live.values()):
-        item = originals_by_key.get(job.media_key)
-        if item is None or isinstance(item, Exception):
-            fail(job, f"original could not be read: {item or 'no response'}")
-            continue
-        try:
-            check_original(item, job)
-        except ReplaceError as exc:
-            fail(job, str(exc))
-            continue
-        blocked = refusal(settings, item)
-        if blocked:
-            outcomes[job.key] = Outcome("refused", blocked, job.media_key)
-            live.pop(job.key)
-            continue
-        originals[job.key] = item
-
-    # 5: the replacements, by the content hash of what was uploaded.
-    progress(f"finding {len(live)} replacement(s)")
-    matches = library.find_uploaded_many([job.output for job in live.values()])
-    replacement_keys: dict[str, str] = {}
-    for job in list(live.values()):
-        match = matches.get(job.output)
-        if match is None:
-            fail(job, "replacement not found by content hash; not guessing")
-        elif isinstance(match, Exception):
-            fail(job, f"replacement lookup failed: {match}")
-        else:
-            replacement_keys[job.key] = match["id"]
+    # 5: the replacements.
+    batch.find_replacements()
 
     def read_replacements(keys: list[str]) -> dict[str, dict[str, Any]]:
-        found = library.get_items([replacement_keys[key] for key in keys])
+        found = library.get_items([batch.matches[key]["id"] for key in keys])
         result = {}
         for key in keys:
-            item = found.get(replacement_keys[key])
+            item = found.get(batch.matches[key]["id"])
             if item is None or isinstance(item, Exception):
                 fail(live[key], f"replacement could not be read: {item or 'no response'}")
                 continue
@@ -244,14 +305,14 @@ def replace_batch(
     replacements = read_replacements(list(live))
     fixes: dict[str, dict[str, Any]] = {}
     for key, replacement in replacements.items():
-        job, original = live[key], originals[key]
+        original = batch.originals[key]
         try:
             check_identity(original, replacement)
         except ReplaceError as exc:
-            fail(job, str(exc))
+            fail(live[key], str(exc))
             continue
         if unexpected_shared_album(original, replacement):
-            fail(job, "replacement is in a shared album the original is not in")
+            fail(live[key], "replacement is in a shared album the original is not in")
             continue
         needed = needed_fixes(original, replacement)
         if needed:
@@ -260,8 +321,8 @@ def replace_batch(
     if not apply:
         for key, job in live.items():
             detail = f"would fix {describe(fixes[key])}, then trash" if key in fixes else "ready to trash"
-            outcomes[key] = Outcome("would_replace", detail, job.media_key)
-        return outcomes
+            batch.outcomes[key] = Outcome("would_replace", detail, job.media_key)
+        return batch.outcomes
 
     # 6: fix what differs, then re-read every fixed replacement -- the re-read,
     # not the fix call's response, is what decides.
@@ -278,38 +339,66 @@ def replace_batch(
                 if key in live:
                     fail(live[key], f"fixing {describe(fixes[key])} failed: {type(exc).__name__}: {exc}")
             failures = {}
-        by_replacement = {replacement_keys[key]: key for key in fixes}
+        by_replacement = {batch.matches[key]["id"]: key for key in fixes}
         for replacement_id, error in failures.items():
             key = by_replacement.get(replacement_id)
             if key in live:
                 fail(live[key], f"fixing {describe(fixes[key])} failed: {error}")
         for key, replacement in read_replacements([key for key in fixes if key in live]).items():
-            still = needed_fixes(originals[key], replacement)
+            still = needed_fixes(batch.originals[key], replacement)
             if still:
                 fail(live[key], f"replacement still differs after fixing: {describe(still)}")
-            elif unexpected_shared_album(originals[key], replacement):
+            elif unexpected_shared_album(batch.originals[key], replacement):
                 fail(live[key], "replacement is in a shared album the original is not in")
 
     if keep_originals:
         for key, job in live.items():
-            outcomes[key] = Outcome("verified_original_kept", "verified, original kept", job.media_key)
-        return outcomes
+            batch.outcomes[key] = Outcome("verified_original_kept", "verified, original kept", job.media_key)
+        return batch.outcomes
 
-    # 7: trash every original still standing in one call, then confirm each in
-    # the bin. Two jobs can name one library item under different media keys;
-    # it shares one dedup key, so it is trashed once and confirms both.
-    if live:
-        progress(f"trashing {len(live)} original(s)")
-        try:
-            library.trash_many(list(dict.fromkeys(originals[key]["dedup_key"] for key in live)))
-        except Exception as exc:  # noqa: BLE001 - recorded against every job in the call
-            for job in list(live.values()):
-                fail(job, f"trash failed: {type(exc).__name__}: {exc}")
-    if live:
-        binned = library.in_bin([originals[key]["dedup_key"] for key in live])
-        for key, job in list(live.items()):
-            if originals[key]["dedup_key"] in binned:
-                outcomes[key] = Outcome("replaced", "replaced, original trashed", job.media_key)
-            else:
-                fail(job, "trash was not confirmed by the server")
-    return outcomes
+    # 7: trash every original still standing, confirmed in the bin.
+    batch.trash_and_confirm(
+        lambda key: batch.originals[key]["dedup_key"], "replaced", lambda key: "replaced, original trashed"
+    )
+    return batch.outcomes
+
+
+def remove_extra_copies(
+    library: Any,
+    jobs: list[UploadRecord],
+    *,
+    settings: Settings,
+    apply: bool,
+    progress: Callable[[str], None] = lambda message: None,
+) -> dict[str, Outcome]:
+    """Trash the replacements whose originals are refused; return each job's outcome.
+
+    A refused original stays in the library, so its uploaded replacement is
+    only an extra copy on this account's storage. Each job's original is read
+    and put to the same gate as replacing. Only for a refused one is the
+    replacement -- resolved by the content hash of the file this tool uploaded,
+    and distinct from the original -- trashed and confirmed in the bin. No
+    original is ever trashed here.
+
+    Statuses: "copy_removed" and "would_remove_copy" (detail: the refusal),
+    "kept" (the original is not refused), "failed".
+    """
+
+    batch = _Batch(library, jobs, settings, progress)
+    batch.read_originals()
+    for key, job in batch.live.items():
+        batch.outcomes[key] = Outcome("kept", "the original is not refused", job.media_key)
+    # From here on the jobs in play are the refused ones.
+    batch.live.clear()
+    batch.live.update({key: batch.jobs[key] for key in batch.refused})
+    batch.find_replacements()
+
+    if not apply:
+        for key, job in batch.live.items():
+            batch.outcomes[key] = Outcome("would_remove_copy", batch.refused[key], job.media_key)
+        return batch.outcomes
+
+    batch.trash_and_confirm(
+        lambda key: batch.matches[key]["dedup_key"], "copy_removed", lambda key: batch.refused[key]
+    )
+    return batch.outcomes

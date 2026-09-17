@@ -280,6 +280,26 @@ trashed whose replacement was not found by content hash and matched against the
 original's identity. Every original also remains in the Takeout export on disk,
 so a mistake is recoverable by re-uploading.
 
+## Removing extra copies
+
+A photo someone else shared into the library -- through partner sharing or a
+shared album -- costs their storage, not yours, and so does an old "High quality"
+upload. Replacing one only adds a copy on your storage, so every route refuses
+them: the encoder and uploader from the sidecar's `googlePhotosOrigin`, the
+replace step from the live quota.
+
+Uploads made before that check existed are cleaned up with:
+
+```powershell
+uv run python tools/takeout_remove_copies.py --journal G:/takeout-work/takeout-upload-journal.json   # dry run
+uv run python tools/takeout_remove_copies.py --journal G:/takeout-work/takeout-upload-journal.json --apply
+```
+
+It asks the replace step's gate of every upload not yet replaced, and for each
+refused original trashes only the replacement this tool uploaded -- found by
+the content hash of the encoded file, distinct from the original, and confirmed
+in the bin. Originals are never touched.
+
 ## The whole sequence
 
 Once set up, a library run is five commands:

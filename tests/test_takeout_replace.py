@@ -18,7 +18,7 @@ from photos_shrink.config import load_config
 from photos_shrink.integrity import sha256_file
 from photos_shrink.ledger import UploadRecord
 from photos_shrink.remote import RemoteProtocolError
-from photos_shrink.replacement import needed_fixes, replace_batch
+from photos_shrink.replacement import needed_fixes, remove_extra_copies, replace_batch
 
 ORIGINAL_BYTES = b"original bytes"
 
@@ -459,3 +459,90 @@ class TestNeededFixes:
 
     def test_a_description_only_the_replacement_has_is_not_a_loss(self):
         assert needed_fixes(make_item("O"), make_item("R", metadata={"description": "x"})) == {}
+
+
+def remove(library, jobs, tmp_path, *, apply=True):
+    return remove_extra_copies(library, jobs, settings=settings_for(tmp_path), apply=apply)
+
+
+class TestRemoveExtraCopies:
+    def free(self, library, name):
+        library.items[f"ORIG-{name}"]["space_taken_bytes"] = 0
+
+    def test_the_copy_of_a_refused_original_is_trashed_and_confirmed(self, tmp_path):
+        job = make_job(tmp_path)
+        library = library_for("one")
+        self.free(library, "one")
+        outcome = remove(library, [job], tmp_path)[job.key]
+        assert (outcome.status, outcome.detail) == ("copy_removed", "non_space_consuming")
+        assert library.trashed() == ["dedup-REPL-one"]
+        assert library.names()[-2:] == ["trash_many", "in_bin"]
+
+    def test_an_original_is_never_trashed(self, tmp_path):
+        jobs = [make_job(tmp_path, n, media_key=f"ORIG-{n}") for n in ("free", "paid")]
+        library = library_for("free", "paid")
+        self.free(library, "free")
+        remove(library, jobs, tmp_path)
+        assert not any(key.startswith("dedup-ORIG") for key in library.trashed())
+
+    def test_the_copy_of_an_original_that_will_be_replaced_is_kept(self, tmp_path):
+        job = make_job(tmp_path)
+        library = library_for("one")
+        outcome = remove(library, [job], tmp_path)[job.key]
+        assert outcome.status == "kept"
+        assert "trash_many" not in library.names()
+        assert ("find_uploaded_many", []) in library.calls
+
+    def test_dry_run_trashes_nothing(self, tmp_path):
+        job = make_job(tmp_path)
+        library = library_for("one")
+        self.free(library, "one")
+        assert remove(library, [job], tmp_path, apply=False)[job.key].status == "would_remove_copy"
+        assert "trash_many" not in library.names()
+
+    def test_an_unreadable_original_keeps_its_copy(self, tmp_path):
+        job = make_job(tmp_path)
+        library = library_for("one")
+        library.items["ORIG-one"] = RemoteProtocolError("rpc=VrseUb")
+        assert remove(library, [job], tmp_path)[job.key].status == "failed"
+        assert library.trashed() == []
+
+    def test_a_size_mismatch_keeps_its_copy(self, tmp_path):
+        """If the sidecar may describe another file, nothing about it is trusted."""
+
+        job = make_job(tmp_path)
+        library = library_for("one")
+        self.free(library, "one")
+        library.items["ORIG-one"]["size_bytes"] = 999
+        assert remove(library, [job], tmp_path)[job.key].status == "failed"
+        assert library.trashed() == []
+
+    def test_a_copy_not_found_by_hash_is_not_guessed(self, tmp_path):
+        job = make_job(tmp_path)
+        library = library_for("one")
+        self.free(library, "one")
+        del library.by_output["one.avif"]
+        assert remove(library, [job], tmp_path)[job.key].status == "failed"
+        assert library.trashed() == []
+
+    def test_a_hash_that_resolves_to_the_original_is_not_trashed(self, tmp_path):
+        job = make_job(tmp_path)
+        library = library_for("one")
+        self.free(library, "one")
+        library.by_output["one.avif"] = "ORIG-one"
+        assert remove(library, [job], tmp_path)[job.key].status == "failed"
+        assert library.trashed() == []
+
+    def test_a_changed_encoded_file_is_not_looked_up(self, tmp_path):
+        job = make_job(tmp_path)
+        job.output.write_bytes(b"changed")
+        library = library_for("one")
+        self.free(library, "one")
+        assert remove(library, [job], tmp_path)[job.key].status == "failed"
+        assert library.trashed() == []
+
+    def test_an_unconfirmed_trash_fails(self, tmp_path):
+        job = make_job(tmp_path)
+        library = library_for("one", trash_takes=False)
+        self.free(library, "one")
+        assert remove(library, [job], tmp_path)[job.key].status == "failed"

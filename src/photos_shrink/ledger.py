@@ -43,7 +43,7 @@ _CORE_FIELDS = (
 # Written later, by the replacement pass. Included in the saved journal only
 # once actually set, so an entry the replace pass has not reached yet keeps
 # the exact shape the uploader wrote -- no "replaced": null appears early.
-_OPTIONAL_FIELDS = ("replaced", "replaced_at", "original_media_key", "replace_error")
+_OPTIONAL_FIELDS = ("replaced", "replaced_at", "original_media_key", "replace_error", "copy_removed_at")
 
 _PATH_FIELDS = ("source", "output")
 
@@ -85,6 +85,9 @@ class UploadRecord:
     replaced_at: str | None = None
     original_media_key: str | None = None
     replace_error: str | None = None
+    # When this upload was trashed as an extra copy of an original that is
+    # refused, and so stays in the library.
+    copy_removed_at: str | None = None
     extra: dict = field(default_factory=dict)
     # The key order this entry had on disk. Older versions of the uploader
     # wrote the same keys in a different order, and re-emitting them
@@ -205,4 +208,18 @@ class UploadJournal:
     def pending_replacement(self) -> list[UploadRecord]:
         """Verified uploads whose original has not been replaced yet."""
 
-        return [r for r in self._records.values() if r.verified == "ok" and not r.replaced]
+        return [
+            r for r in self._records.values()
+            if r.verified == "ok" and not r.replaced and not r.copy_removed_at
+        ]
+
+    def copy_removal_candidates(self) -> list[UploadRecord]:
+        """Uploads whose original has not been replaced and whose copy is still there.
+
+        Pending and refused alike: the live gate decides which are extra copies.
+        """
+
+        return [
+            r for r in self._records.values()
+            if r.replaced != "replaced" and not r.copy_removed_at
+        ]
