@@ -45,6 +45,10 @@ class SessionRefreshError(RemoteProtocolError):
     """Raised when an authenticated browser/session refresh cannot be installed."""
 
 
+class MissingResponseError(RemoteProtocolError):
+    """A call in a batched request that Google sent no response for."""
+
+
 def _asdict(value: Any) -> Any:
     if is_dataclass(value):
         return asdict(value)
@@ -984,7 +988,7 @@ class GooglePhotosRemote:
             name = self._request_name(payload)
             response = by_id.get(getattr(payload, "payload_id", None))
             if response is None:
-                results.append(RemoteProtocolError(f"Google Photos sent no response rpc={name}"))
+                results.append(MissingResponseError(f"Google Photos sent no response rpc={name}"))
             elif not getattr(response, "success", False):
                 results.append(RemoteProtocolError(f"Google Photos returned an unsuccessful response rpc={name}"))
             elif getattr(response, "data", None) is None:
@@ -1008,8 +1012,19 @@ class GooglePhotosRemote:
         return responses
 
     def get_items(self, media_keys: list[str], *, per_request: int = 25) -> dict[str, dict[str, Any] | Exception]:
-        """`get_item` for many keys: each key maps to its item, or to why it could not be read."""
+        """`get_item` for many keys: each key maps to its item, or to why it could not be read.
 
+        Live, Google sometimes leaves a call in a large request unanswered; those
+        keys are asked again, one per request.
+        """
+
+        results = self._get_items(media_keys, per_request)
+        unanswered = [key for key, value in results.items() if isinstance(value, MissingResponseError)]
+        if unanswered:
+            results.update(self._get_items(unanswered, 1))
+        return results
+
+    def _get_items(self, media_keys: list[str], per_request: int) -> dict[str, dict[str, Any] | Exception]:
         self._load_dependencies()
         results: dict[str, dict[str, Any] | Exception] = {}
         keys = list(dict.fromkeys(media_keys))
@@ -1068,18 +1083,26 @@ class GooglePhotosRemote:
                         results[path] = {"id": media_key, "dedup_key": dedup_key}
         return results
 
-    def restore_many(self, fixes: list[dict[str, Any]], *, per_request: int = 50) -> dict[str, Exception]:
+    def restore_many(self, fixes: list[dict[str, Any]], *, per_call: int = 100) -> dict[str, Exception]:
         """Apply metadata fixes to replacements; return the failures by replacement id.
 
         Each fix names a `replacement` item and only what must change:
         `timestamp` as (epoch ms, offset ms), `albums` to add it to, and
         `favorite`, `archived` or `description`. A successful call proves
         nothing on its own -- the caller re-reads every fixed replacement.
+
+        Each kind of change goes out as one call carrying a list of items, in
+        a request of its own. Live, Google answered HTTP 400 to a request
+        holding eleven capture-time calls, yet accepted one call listing
+        several items.
         """
 
         self._load_dependencies()
-        calls: list[tuple[str, Any]] = []
         failures: dict[str, Exception] = {}
+        timestamps: list[tuple[str, list[Any]]] = []
+        albums: dict[tuple[str, bool], list[str]] = {}
+        flags: dict[Any, list[tuple[str, str]]] = {}
+        descriptions: list[tuple[str, str, str]] = []
         for fix in fixes:
             replacement = fix["replacement"]
             item_id, dedup = replacement["id"], replacement["dedup_key"]
@@ -1087,34 +1110,51 @@ class GooglePhotosRemote:
                 timestamp, offset = fix["timestamp"]
                 if offset % 1000:
                     failures[item_id] = RemoteProtocolError("original timezone offset is not whole seconds")
-                    continue
-                # Seconds, both of them. gpwc documents the timestamp in
-                # milliseconds, but Google refuses that; live, only seconds took.
-                calls.append((item_id, self._payloads.SetItemTimestamp(dedup, timestamp // 1000, offset // 1000)))
+                else:
+                    # Seconds, both of them. gpwc documents the timestamp in
+                    # milliseconds, but Google refuses that; live, only seconds took.
+                    timestamps.append((item_id, [dedup, timestamp // 1000, offset // 1000]))
             for album in fix.get("albums", []):
                 if album["shared"] and self.skip_shared:
                     failures[item_id] = RemoteProtocolError("shared album association cannot be restored safely")
-                    continue
-                payload_type = (
-                    self._payloads.AddItemsToExistingSharedAlbum
-                    if album["shared"]
-                    else self._payloads.AddItemsToExistingAlbum
-                )
-                calls.append((item_id, payload_type([item_id], album["id"])))
+                else:
+                    albums.setdefault((album["id"], album["shared"]), []).append(item_id)
             if "favorite" in fix:
                 payload = self._payloads.SetFavorite if fix["favorite"] else self._payloads.UnFavorite
-                calls.append((item_id, payload([dedup])))
+                flags.setdefault(payload, []).append((item_id, dedup))
             if "archived" in fix:
                 payload = self._payloads.SetArchive if fix["archived"] else self._payloads.UnArchive
-                calls.append((item_id, payload([dedup])))
+                flags.setdefault(payload, []).append((item_id, dedup))
             if "description" in fix:
-                calls.append((item_id, self._payloads.SetItemDescription(dedup, fix["description"])))
-        for start in range(0, len(calls), per_request):
-            chunk = calls[start : start + per_request]
-            answers = self._execute_many([payload for _, payload in chunk])
-            for (item_id, _), answer in zip(chunk, answers, strict=True):
-                if isinstance(answer, Exception):
-                    failures.setdefault(item_id, answer)
+                descriptions.append((item_id, dedup, fix["description"]))
+
+        calls: list[tuple[list[str], Any]] = []
+        for start in range(0, len(timestamps), per_call):
+            chunk = timestamps[start : start + per_call]
+            payload = self._payloads.SetItemTimestamp(*chunk[0][1])
+            # gpwc builds the call for one item; the call itself takes a list.
+            payload.data = [[entry for _, entry in chunk]]
+            calls.append(([item_id for item_id, _ in chunk], payload))
+        for (album_id, shared), item_ids in albums.items():
+            payload_type = (
+                self._payloads.AddItemsToExistingSharedAlbum if shared else self._payloads.AddItemsToExistingAlbum
+            )
+            for start in range(0, len(item_ids), per_call):
+                chunk = item_ids[start : start + per_call]
+                calls.append((chunk, payload_type(chunk, album_id)))
+        for payload_type, entries in flags.items():
+            for start in range(0, len(entries), per_call):
+                chunk = entries[start : start + per_call]
+                calls.append(([item_id for item_id, _ in chunk], payload_type([dedup for _, dedup in chunk])))
+        for item_id, dedup, description in descriptions:
+            calls.append(([item_id], self._payloads.SetItemDescription(dedup, description)))
+
+        for item_ids, payload in calls:
+            try:
+                self._execute(payload)
+            except RemoteProtocolError as exc:
+                for item_id in item_ids:
+                    failures.setdefault(item_id, exc)
         return failures
 
     def trash_many(self, dedup_keys: list[str], *, per_request: int = 100) -> None:

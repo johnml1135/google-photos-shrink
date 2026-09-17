@@ -150,6 +150,30 @@ class TestGetItems:
         assert result["good"]["id"] == "good"
         assert isinstance(result["bad"], RemoteProtocolError)
 
+    def test_an_unanswered_item_is_asked_again_on_its_own(self):
+        """Live: a batched request came back missing an item's extended info."""
+
+        items = {key: info_and_ext(key) for key in ("a", "b")}
+        dropped = []
+
+        def send(payloads):
+            calls = payloads if isinstance(payloads, list) else [payloads]
+            responses = []
+            for payload in calls:
+                key = payload.args[0]
+                if len(calls) > 2 and key == "b" and isinstance(payload, Payloads.GetItemInfoExt):
+                    dropped.append(key)
+                    continue
+                data = items[key][0 if isinstance(payload, Payloads.GetItemInfo) else 1]
+                responses.append(SimpleNamespace(response_id=payload.payload_id, success=True, data=data))
+            return responses
+
+        client = BatchClient()
+        client.send_api_request = send
+        result = remote_with(client).get_items(["a", "b"])
+        assert dropped == ["b"]
+        assert result["b"]["id"] == "b"
+
     def test_a_missing_offset_in_the_extended_info_falls_back_to_the_basic_info(self):
         """The live case: API uploads report no offset in the extended info."""
 
@@ -193,29 +217,35 @@ class TestFindUploadedMany:
 
 class TestRestoreMany:
     REPLACEMENT = {"id": "R", "dedup_key": "dR"}
+    OTHER = {"id": "S", "dedup_key": "dS"}
 
-    def test_builds_one_call_per_change_in_one_request(self):
+    def test_each_kind_of_change_is_one_call_listing_every_item_in_its_own_request(self):
+        """Live: eleven capture-time calls in one request got HTTP 400; one call listing items took."""
+
         client = BatchClient()
-        failures = remote_with(client).restore_many([{
-            "replacement": self.REPLACEMENT,
-            "timestamp": (1_700_000_000_000, -14_400_000),
-            "albums": [{"id": "trip", "title": "Trip", "shared": False}],
-            "favorite": True,
-            "archived": False,
-            "description": "beach",
-        }])
+        trip = {"id": "trip", "title": "Trip", "shared": False}
+        failures = remote_with(client).restore_many([
+            {"replacement": self.REPLACEMENT, "timestamp": (1_700_000_000_521, -14_400_000),
+             "albums": [trip], "favorite": True, "archived": False, "description": "beach"},
+            {"replacement": self.OTHER, "timestamp": (1_600_000_000_000, 0), "albums": [trip], "favorite": True},
+        ])
         assert failures == {}
-        (request,) = client.requests
-        calls = {type(p).__name__: p.args for p in request}
-        assert calls["SetItemTimestamp"] == ("dR", 1_700_000_000, -14_400)
-        assert calls["AddItemsToExistingAlbum"] == (["R"], "trip")
-        assert calls["SetFavorite"] == (["dR"],)
-        assert calls["UnArchive"] == (["dR"],)
-        assert calls["SetItemDescription"] == ("dR", "beach")
+        assert all(len(request) == 1 for request in client.requests)
+        calls = {type(r[0]).__name__: r[0] for r in client.requests}
+        assert len(client.requests) == len(calls)
+        assert calls["SetItemTimestamp"].data == [[["dR", 1_700_000_000, -14_400], ["dS", 1_600_000_000, 0]]]
+        assert calls["AddItemsToExistingAlbum"].args == (["R", "S"], "trip")
+        assert calls["SetFavorite"].args == (["dR", "dS"],)
+        assert calls["UnArchive"].args == (["dR"],)
+        assert calls["SetItemDescription"].args == ("dR", "beach")
 
-    def test_a_failed_call_is_reported_against_its_replacement(self):
+    def test_a_failed_call_is_reported_against_every_item_it_carried(self):
         client = BatchClient(lambda p: None if isinstance(p, Payloads.SetItemTimestamp) else True)
-        failures = remote_with(client).restore_many([{"replacement": self.REPLACEMENT, "timestamp": (1, 0)}])
+        failures = remote_with(client).restore_many([
+            {"replacement": self.REPLACEMENT, "timestamp": (1000, 0)},
+            {"replacement": self.OTHER, "timestamp": (2000, 0), "favorite": True},
+        ])
+        assert set(failures) == {"R", "S"}
         assert "rpc=DaSgWe" in str(failures["R"])
 
     def test_a_shared_album_is_refused_when_shared_albums_are_skipped(self):
