@@ -47,12 +47,16 @@ class Candidate:
     # Known only from a Takeout sidecar; the live library does not report it,
     # but such an item consumes no quota there and is refused on that instead.
     shared_origin: bool = False
+    skip_reason: str | None = None
+    favorite: bool | None = False
+    archived: bool | None = False
 
     @classmethod
     def from_library_item(cls, item: dict[str, Any]) -> Candidate:
         """Build a candidate from a live Google Photos library item."""
 
-        albums = (item.get("metadata") or {}).get("albums") or []
+        metadata = item.get("metadata") or {}
+        albums = metadata.get("albums") or []
         shared_album = any(
             bool(album.get("shared")) for album in albums if isinstance(album, dict)
         )
@@ -64,6 +68,9 @@ class Candidate:
             space_taken_bytes=item.get("space_taken_bytes"),
             shared_album=shared_album,
             space_consuming=item.get("space_consuming"),
+            skip_reason=item.get("skip_reason"),
+            favorite=metadata.get("favorite"),
+            archived=metadata.get("archived"),
         )
 
     @classmethod
@@ -136,7 +143,8 @@ def verdict(settings: Settings, candidate: Candidate) -> str | None:
     """Return why this photo must not be replaced, or None when it may be.
 
     Refusal tokens: "no_media_key", "shared_to_you", "non_photo", "shared_album",
-    "non_space_consuming", whatever `Settings.exclusion_reason` returns
+    "non_space_consuming", "shared_item", "partial_upload", "motion_photo",
+    "unknown_favorite_or_archive", whatever `Settings.exclusion_reason` returns
     ("excluded_name", "missing_capture_date", "invalid_capture_date",
     "excluded_date"), and "insufficient_savings".
     """
@@ -166,7 +174,17 @@ def verdict(settings: Settings, candidate: Candidate) -> str | None:
         # Not yet encoded (`saved_percent is None`) is not a refusal either --
         # it means "ask again after encoding", not "insufficient".
         return "insufficient_savings"
-    return None
+    # These live-library facts are only available after the item is read. They
+    # belong here, after the established policy branches, so adding them does
+    # not change the spelling or precedence of an existing verdict.
+    if candidate.favorite is None or candidate.archived is None:
+        return "unknown_favorite_or_archive"
+    return {
+        "shared item": "shared_item",
+        "shared album association": "shared_album",
+        "partial upload": "partial_upload",
+        "motion photo association is unsupported": "motion_photo",
+    }.get(candidate.skip_reason)
 
 
 # Every token `verdict` can return, and how it reads in a report. The
@@ -182,6 +200,10 @@ REFUSAL_TEXT = {
     "excluded_name": "excluded by configured name pattern",
     "non_photo": "photos_only is set and this item is not a photo",
     "shared_album": "shared album",
+    "shared_item": "shared item",
+    "partial_upload": "partial upload",
+    "motion_photo": "motion photo association is unsupported",
+    "unknown_favorite_or_archive": "favorite/archive metadata is unknown",
     "non_space_consuming": "item does not consume quota",
     "insufficient_savings": "encoding saved too little to be worth the quota",
 }

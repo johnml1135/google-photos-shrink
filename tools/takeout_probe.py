@@ -3,7 +3,7 @@
 Answers the two questions the whole Takeout plan rests on:
 
   1. Does Takeout hand back bytes that hash-match what Google stores?
-     If yes, `find_uploaded()` is a sound join key and deletion can be targeted
+     If yes, `find_uploaded_many()` is a sound join key and deletion can be targeted
      precisely. If no, we need a fuzzier join and much stronger guardrails.
   2. How complete is the export's metadata? Files without a resolvable sidecar
      would lose their timestamps and must be quarantined, not uploaded.
@@ -141,12 +141,15 @@ def main() -> int:
                 return 2
             print(f"Account: {remote.account_id()}", flush=True)
             hits = 0
+            try:
+                matches = remote.find_uploaded_many([record.path for record in chosen])
+            except Exception as exc:  # noqa: BLE001 - probe reports, never raises
+                matches = {record.path: exc for record in chosen}
             for index, record in enumerate(chosen, 1):
-                try:
-                    match = remote.find_uploaded(record.path)
-                except Exception as exc:  # noqa: BLE001 - probe reports, never raises
-                    print(f"  [{index}/{len(chosen)}] {record.path.name}: ERROR {type(exc).__name__}", flush=True)
-                    report["matches"].append({"file": str(record.path), "result": "error", "error": str(exc)})
+                match = matches.get(record.path)
+                if isinstance(match, Exception):
+                    print(f"  [{index}/{len(chosen)}] {record.path.name}: ERROR {type(match).__name__}", flush=True)
+                    report["matches"].append({"file": str(record.path), "result": "error", "error": str(match)})
                     continue
                 hits += match is not None
                 verdict = "MATCH" if match else "no match"

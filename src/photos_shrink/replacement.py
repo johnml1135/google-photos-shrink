@@ -42,20 +42,6 @@ class ReplaceError(RuntimeError):
     """Raised when a replacement cannot be completed safely."""
 
 
-# `GooglePhotosRemote` flags an item it cannot safely handle. For an original
-# about to be trashed, these flags refuse it. The others -- ownership the web
-# client cannot read, an unknown media type, no download URL -- say nothing
-# about whether deleting it loses anything: the original is in this account's
-# own Takeout export and costs its quota, which the gate requires.
-REFUSED_ORIGINAL_STATES = {
-    "shared item": "shared_item",
-    "shared album association": "shared_album",
-    "partial upload": "partial_upload",
-    "motion photo association is unsupported": "motion_photo",
-    "favorite/archive metadata unknown": "unknown_favorite_or_archive",
-}
-
-
 @dataclass(frozen=True)
 class Outcome:
     """What happened, or would happen, to one job."""
@@ -81,20 +67,6 @@ def check_original(item: dict[str, Any], job: UploadRecord) -> None:
             f"library item is {item.get('size_bytes')} bytes but the exported original is "
             f"{exported}; the sidecar may describe a different file"
         )
-
-
-def refusal(settings: Settings, original: dict[str, Any]) -> str | None:
-    """Why this original must not be replaced, or None when it may be."""
-
-    blocked = verdict(settings, Candidate.from_library_item(original))
-    if blocked:
-        return blocked
-    metadata = original.get("metadata") or {}
-    # Checked here as well as through the flags: the adapter reports only its
-    # first concern, so an unreadable owner can hide an unknown favorite.
-    if metadata.get("favorite") is None or metadata.get("archived") is None:
-        return "unknown_favorite_or_archive"
-    return REFUSED_ORIGINAL_STATES.get(original.get("skip_reason") or "")
 
 
 def check_identity(original: dict[str, Any], replacement: dict[str, Any]) -> None:
@@ -151,6 +123,8 @@ def unexpected_shared_album(original: dict[str, Any], replacement: dict[str, Any
 
 
 def describe(fixes: dict[str, Any]) -> str:
+    """Describe metadata fixes briefly."""
+
     parts = []
     if "timestamp" in fixes:
         parts.append("capture time")
@@ -216,7 +190,7 @@ class _Batch:
                 self.fail(job, str(exc))
                 continue
             self.originals[job.key] = item
-            blocked = refusal(self.settings, item)
+            blocked = verdict(self.settings, Candidate.from_library_item(item))
             if blocked:
                 self.refused[job.key] = blocked
                 self.live.pop(job.key)

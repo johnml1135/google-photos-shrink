@@ -64,15 +64,8 @@ class Settings:
     exclude: dict[str, Any]
     fingerprint: str
 
-    @property
-    def config_dir(self) -> Path:
-        return self.path.parent
-
     def as_dict(self) -> dict[str, dict[str, Any]]:
         return {key: copy.deepcopy(getattr(self, key)) for key in DEFAULTS}
-
-    def __getitem__(self, key: str) -> dict[str, Any]:
-        return getattr(self, key)
 
     def exclusion_reason(self, item: dict[str, Any]) -> str | None:
         filename = str(item.get("filename") or "")

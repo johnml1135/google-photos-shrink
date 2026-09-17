@@ -10,6 +10,8 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import pytest
+
 from photos_shrink.config import load_config
 from photos_shrink.policy import Candidate, verdict
 from photos_shrink.takeout import MirrorEntry
@@ -69,6 +71,17 @@ class TestCandidateFromLibraryItem:
         assert candidate.space_taken_bytes == 456
         assert candidate.shared_album is False
         assert candidate.saved_percent is None
+
+    def test_carries_live_metadata_needed_by_verdict(self):
+        item = {
+            "id": "KEY1",
+            "skip_reason": "partial upload",
+            "metadata": {"favorite": True, "archived": False},
+        }
+        candidate = Candidate.from_library_item(item)
+        assert candidate.skip_reason == "partial upload"
+        assert candidate.favorite is True
+        assert candidate.archived is False
 
     def test_detects_a_shared_album(self):
         item = {"id": "K", "metadata": {"albums": [{"id": "a", "shared": True}]}}
@@ -247,6 +260,30 @@ class TestVerdict:
                                         space_taken_bytes=0)
         assert verdict(settings, candidate) == "no_media_key"
 
+    @pytest.mark.parametrize(
+        ("skip_reason", "expected"),
+        [
+            ("shared item", "shared_item"),
+            ("shared album association", "shared_album"),
+            ("partial upload", "partial_upload"),
+            ("motion photo association is unsupported", "motion_photo"),
+        ],
+    )
+    def test_live_skip_reasons_are_refused_by_the_policy(self, tmp_path, skip_reason, expected):
+        settings = settings_for(tmp_path, skip_shared="false")
+        candidate = ordinary_candidate(skip_reason=skip_reason, favorite=False, archived=False)
+        assert verdict(settings, candidate) == expected
+
+    def test_unknown_favorite_or_archive_is_a_policy_refusal(self, tmp_path):
+        settings = settings_for(tmp_path)
+        candidate = ordinary_candidate(favorite=None, archived=False)
+        assert verdict(settings, candidate) == "unknown_favorite_or_archive"
+
+    def test_unknown_ownership_is_not_a_policy_refusal(self, tmp_path):
+        settings = settings_for(tmp_path)
+        candidate = ordinary_candidate(skip_reason="ownership is unknown")
+        assert verdict(settings, candidate) is None
+
 
 class TestRefusalVocabulary:
     """Every refusal `verdict` can reach must have a line a human can read.
@@ -280,6 +317,11 @@ class TestRefusalVocabulary:
             ordinary_candidate(timestamp_ms="not-a-time"),
             ordinary_candidate(timestamp_ms=in_2019),
             ordinary_candidate(saved_percent=1.0),
+            ordinary_candidate(skip_reason="shared item"),
+            ordinary_candidate(skip_reason="shared album association"),
+            ordinary_candidate(skip_reason="partial upload"),
+            ordinary_candidate(skip_reason="motion photo association is unsupported"),
+            ordinary_candidate(favorite=None),
         ]
         return {token for token in (verdict(settings, c) for c in cases) if token}
 
