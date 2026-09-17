@@ -392,6 +392,26 @@ class TestFixes:
         assert library.calls[4] == ("get_items", ["REPL-dated"])
 
 
+class TestFixRequestRejected:
+    def test_a_rejected_fix_request_fails_only_the_items_being_fixed(self, tmp_path):
+        """The live run: Google answered the whole fix request with HTTP 400."""
+
+        clean = make_job(tmp_path, "clean", media_key="ORIG-clean")
+        dated = make_job(tmp_path, "dated", media_key="ORIG-dated")
+        library = library_for("clean", "dated")
+        library.items["REPL-dated"]["timestamp_ms"] = 1
+
+        def rejected(fixes):
+            raise RemoteProtocolError("Google Photos request failed rpc=DaSgWe status=400")
+
+        library.restore_many = rejected
+        outcomes = run(library, [clean, dated], tmp_path)
+        assert outcomes[clean.key].status == "replaced"
+        assert outcomes[dated.key].status == "failed"
+        assert "status=400" in outcomes[dated.key].detail
+        assert library.trashed() == ["dedup-ORIG-clean"]
+
+
 class TestTrash:
     def test_two_keys_for_one_library_item_trash_once_and_both_confirm(self, tmp_path):
         """The live IMG_2004 case: two sidecars, two media keys, one item."""
@@ -421,6 +441,14 @@ class TestTrash:
 class TestNeededFixes:
     def test_nothing_when_everything_agrees(self):
         assert needed_fixes(make_item("O"), make_item("R")) == {}
+
+    def test_milliseconds_are_not_a_difference(self):
+        """Google sets capture time in whole seconds, so a fix drops them."""
+
+        assert needed_fixes(make_item("O", timestamp_ms=1_700_000_000_521), make_item("R")) == {}
+
+    def test_a_second_is_a_difference(self):
+        assert "timestamp" in needed_fixes(make_item("O", timestamp_ms=1_700_000_001_000), make_item("R"))
 
     def test_timezone_alone_is_a_difference(self):
         assert "timestamp" in needed_fixes(make_item("O"), make_item("R", timezone_offset=0))

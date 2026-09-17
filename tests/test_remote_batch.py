@@ -207,7 +207,7 @@ class TestRestoreMany:
         assert failures == {}
         (request,) = client.requests
         calls = {type(p).__name__: p.args for p in request}
-        assert calls["SetItemTimestamp"] == ("dR", 1_700_000_000_000, -14_400)
+        assert calls["SetItemTimestamp"] == ("dR", 1_700_000_000, -14_400)
         assert calls["AddItemsToExistingAlbum"] == (["R"], "trip")
         assert calls["SetFavorite"] == (["dR"],)
         assert calls["UnArchive"] == (["dR"],)

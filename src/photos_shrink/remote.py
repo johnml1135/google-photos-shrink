@@ -1088,7 +1088,9 @@ class GooglePhotosRemote:
                 if offset % 1000:
                     failures[item_id] = RemoteProtocolError("original timezone offset is not whole seconds")
                     continue
-                calls.append((item_id, self._payloads.SetItemTimestamp(dedup, timestamp, offset // 1000)))
+                # Seconds, both of them. gpwc documents the timestamp in
+                # milliseconds, but Google refuses that; live, only seconds took.
+                calls.append((item_id, self._payloads.SetItemTimestamp(dedup, timestamp // 1000, offset // 1000)))
             for album in fix.get("albums", []):
                 if album["shared"] and self.skip_shared:
                     failures[item_id] = RemoteProtocolError("shared album association cannot be restored safely")

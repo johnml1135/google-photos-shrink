@@ -111,13 +111,19 @@ def _albums(item: dict[str, Any]) -> dict[str, dict[str, Any]]:
     return {album["id"]: album for album in albums if isinstance(album, dict) and album.get("id")}
 
 
+def _to_the_second(item: dict[str, Any]) -> tuple[Any, Any]:
+    timestamp = item.get("timestamp_ms")
+    return (timestamp // 1000 if isinstance(timestamp, int) else timestamp, item.get("timezone_offset"))
+
+
 def needed_fixes(original: dict[str, Any], replacement: dict[str, Any]) -> dict[str, Any]:
     """What must change on the replacement to carry the original's metadata. Empty when nothing."""
 
     fixes: dict[str, Any] = {}
-    when = (original.get("timestamp_ms"), original.get("timezone_offset"))
-    if (replacement.get("timestamp_ms"), replacement.get("timezone_offset")) != when:
-        fixes["timestamp"] = when
+    # Compared to the second: Google sets a capture time in whole seconds, so a
+    # fixed replacement can never carry the original's milliseconds.
+    if _to_the_second(replacement) != _to_the_second(original):
+        fixes["timestamp"] = (original.get("timestamp_ms"), original.get("timezone_offset"))
     have = _albums(replacement)
     missing = [album for key, album in _albums(original).items() if key not in have]
     if missing:
@@ -261,9 +267,17 @@ def replace_batch(
     # not the fix call's response, is what decides.
     if fixes:
         progress(f"fixing {len(fixes)} replacement(s)")
-        failures = library.restore_many(
-            [{"replacement": replacements[key], **needed} for key, needed in fixes.items() if key in live]
-        )
+        try:
+            failures = library.restore_many(
+                [{"replacement": replacements[key], **needed} for key, needed in fixes.items() if key in live]
+            )
+        except Exception as exc:  # noqa: BLE001 - fails only the items that needed fixing
+            # A rejected fix request must not stop replacements that already
+            # match: fail the ones it was fixing and carry on with the rest.
+            for key in fixes:
+                if key in live:
+                    fail(live[key], f"fixing {describe(fixes[key])} failed: {type(exc).__name__}: {exc}")
+            failures = {}
         by_replacement = {replacement_keys[key]: key for key in fixes}
         for replacement_id, error in failures.items():
             key = by_replacement.get(replacement_id)
