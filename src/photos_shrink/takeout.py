@@ -21,6 +21,8 @@ from typing import Any
 from .integrity import sha256_file
 
 SUPPLEMENTAL = "supplemental-metadata"
+# What Takeout appends to a photo you edited in Google Photos.
+EDIT_SUFFIX = "-edited"
 EDITED = "-edited"
 
 PHOTO_SUFFIXES = frozenset(
@@ -320,6 +322,11 @@ class MirrorEntry:
     edited: bool = False
     has_sidecar: bool = False
     origin: str | None = None
+    # Every exported copy's size, largest first. An edited photo is exported
+    # twice under one media key -- the edit and the untouched original -- and
+    # Google reports the size of whichever one it still calls the original, so
+    # the replace step has to accept either.
+    sizes: tuple[int, ...] = ()
 
     @property
     def uploadable(self) -> bool:
@@ -365,6 +372,7 @@ def mirror(root: str | os.PathLike[str]) -> list[MirrorEntry]:
                 edited=best.edited,
                 has_sidecar=best.sidecar is not None,
                 origin=best.origin,
+                sizes=tuple(sorted({r.size_bytes for r in records}, reverse=True)),
             )
         )
     for record in orphans:
@@ -384,6 +392,7 @@ def mirror(root: str | os.PathLike[str]) -> list[MirrorEntry]:
                 edited=record.edited,
                 has_sidecar=record.sidecar is not None,
                 origin=record.origin,
+                sizes=(record.size_bytes,),
             )
         )
     entries.sort(key=lambda e: e.size_bytes, reverse=True)

@@ -270,3 +270,31 @@ class TestMirror:
         entries = {e.filename: e for e in takeout.mirror(tmp_path)}
         assert entries["IMG_1.jpg"].uploadable
         assert not entries["nosidecar.jpg"].uploadable
+
+
+class TestExportedSizes:
+    """Every copy's size travels with the mirror entry, for the replace step."""
+
+    def test_an_edited_photo_carries_both_sizes(self, tmp_path):
+        from photos_shrink.mirror_sizes import load_exported_sizes
+
+        (tmp_path / "IMG_1.jpg").write_bytes(b"x" * 10)
+        (tmp_path / "IMG_1-edited.jpg").write_bytes(b"y" * 25)
+        payload = sidecar_payload(title="IMG_1.jpg")
+        payload["url"] = "https://photos.google.com/photo/KEY1"
+        write(tmp_path / "IMG_1.jpg.json", payload)
+        (entry,) = [e for e in takeout.mirror(tmp_path) if e.media_key]
+        assert entry.sizes == (25, 10)
+
+        mirror_csv = tmp_path / "mirror.csv"
+        mirror_csv.write_text(
+            "media_key,sizes\n" + f"{entry.media_key},25 10\n", encoding="utf-8"
+        )
+        assert load_exported_sizes(mirror_csv) == {entry.media_key: {25, 10}}
+
+    def test_a_mirror_without_the_column_reports_nothing(self, tmp_path):
+        from photos_shrink.mirror_sizes import load_exported_sizes
+
+        path = tmp_path / "old-mirror.csv"
+        path.write_text("media_key,path\nKEY,a.jpg\n", encoding="utf-8")
+        assert load_exported_sizes(path) == {}

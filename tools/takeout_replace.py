@@ -20,6 +20,7 @@ from pathlib import Path
 
 from photos_shrink.config import load_config
 from photos_shrink.ledger import UploadJournal
+from photos_shrink.mirror_sizes import load_exported_sizes
 from photos_shrink.remote import COOKIE_HINT, RemoteProtocolError, open_session
 from photos_shrink.replacement import replace_batch
 
@@ -61,6 +62,7 @@ def main() -> int:
     data_dir = Path(settings.run["data_dir"])
     mirror_path = args.mirror or data_dir / "mirror.csv"
     mirror_keys = _load_mirror_keys(mirror_path)
+    exported_sizes = load_exported_sizes(mirror_path)
 
     todo = journal.pending_replacement()
     if args.limit:
@@ -95,7 +97,7 @@ def main() -> int:
                 try:
                     outcomes = replace_batch(
                         remote, batch, settings=settings, apply=args.apply,
-                        keep_originals=args.keep_originals,
+                        keep_originals=args.keep_originals, sizes=exported_sizes,
                         progress=lambda message, label=label: print(f"{label} {message}", flush=True),
                     )
                 except RemoteProtocolError as exc:

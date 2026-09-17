@@ -37,6 +37,7 @@ FIELDS = [
     "longitude",
     "url",
     "origin",
+    "sizes",
     "path",
 ]
 
@@ -83,6 +84,7 @@ def main() -> int:
                     "longitude": entry.longitude if entry.longitude is not None else "",
                     "url": entry.url or "",
                     "origin": entry.origin or "",
+                    "sizes": " ".join(str(size) for size in entry.sizes),
                     "path": str(entry.path),
                 }
             )

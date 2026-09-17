@@ -18,7 +18,13 @@ from photos_shrink.config import load_config
 from photos_shrink.integrity import sha256_file
 from photos_shrink.ledger import UploadRecord
 from photos_shrink.remote import RemoteProtocolError
-from photos_shrink.replacement import needed_fixes, remove_extra_copies, replace_batch
+from photos_shrink.replacement import (
+    ReplaceError,
+    check_original,
+    needed_fixes,
+    remove_extra_copies,
+    replace_batch,
+)
 
 ORIGINAL_BYTES = b"original bytes"
 
@@ -546,3 +552,51 @@ class TestRemoveExtraCopies:
         library = library_for("one", trash_takes=False)
         self.free(library, "one")
         assert remove(library, [job], tmp_path)[job.key].status == "failed"
+
+
+class TestAnEditedOriginal:
+    """Takeout exports an edited photo twice under one media key.
+
+    Google keeps reporting the untouched copy's name and size, so the exported
+    file the tool encoded -- the edit -- does not match on size alone. The
+    sizes come from the mirror, so accepting either costs no extra request.
+    """
+
+    def _job(self, tmp_path, name="IMG_1.jpg"):
+        source = tmp_path / name
+        source.write_bytes(ORIGINAL_BYTES)
+        return UploadRecord(source=source, output=tmp_path / "o.avif", media_key="ORIG-one")
+
+    def test_the_untouched_copys_size_is_accepted_for_an_edit(self, tmp_path):
+        job = self._job(tmp_path, "IMG_1-edited.jpg")
+        item = make_item("ORIG-one", size_bytes=999, filename="IMG_1.jpg")
+        check_original(item, job, {999, len(ORIGINAL_BYTES)})
+
+    def test_a_different_name_is_still_refused(self, tmp_path):
+        """The check that stops a sidecar paired with an unrelated file."""
+
+        job = self._job(tmp_path, "IMG_1-edited.jpg")
+        item = make_item("ORIG-one", size_bytes=999, filename="SOMETHING_ELSE.jpg")
+        with pytest.raises(ReplaceError, match="may describe a different file"):
+            check_original(item, job, {999})
+
+    def test_a_size_from_another_media_key_is_refused(self, tmp_path):
+        job = self._job(tmp_path, "IMG_1-edited.jpg")
+        item = make_item("ORIG-one", size_bytes=999, filename="IMG_1.jpg")
+        with pytest.raises(ReplaceError, match="may describe a different file"):
+            check_original(item, job, {12345})
+
+    def test_an_exact_match_still_needs_no_size_list(self, tmp_path):
+        job = self._job(tmp_path)
+        check_original(make_item("ORIG-one"), job, None)
+
+    def test_the_edit_goes_through_the_whole_batch(self, tmp_path):
+        job = make_job(tmp_path)
+        job = UploadRecord(source=job.source, output=job.output, media_key="ORIG-one",
+                           output_sha256=job.output_sha256)
+        library = library_for("one")
+        library.items["ORIG-one"]["size_bytes"] = 999
+        library.items["ORIG-one"]["filename"] = "IMG_1.jpg"
+        outcomes = replace_batch(library, [job], settings=settings_for(tmp_path), apply=True,
+                                 keep_originals=False, sizes={"ORIG-one": {999}})
+        assert outcomes[job.key].status == "replaced"

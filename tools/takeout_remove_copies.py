@@ -19,6 +19,7 @@ from pathlib import Path
 
 from photos_shrink.config import load_config
 from photos_shrink.ledger import UploadJournal
+from photos_shrink.mirror_sizes import load_exported_sizes
 from photos_shrink.remote import COOKIE_HINT, RemoteProtocolError, open_session
 from photos_shrink.replacement import remove_extra_copies
 
@@ -41,6 +42,7 @@ def main() -> int:
         return 2
     journal = UploadJournal.load(args.journal)
     settings = load_config(args.config)
+    exported_sizes = load_exported_sizes(Path(settings.run["data_dir"]) / "mirror.csv")
 
     todo = journal.copy_removal_candidates()
     if args.limit:
@@ -62,7 +64,7 @@ def main() -> int:
                 label = f"[{start + 1}-{start + len(batch)}/{len(todo)}]"
                 try:
                     outcomes = remove_extra_copies(
-                        remote, batch, settings=settings, apply=args.apply,
+                        remote, batch, settings=settings, apply=args.apply, sizes=exported_sizes,
                         progress=lambda message, label=label: print(f"{label} {message}", flush=True),
                     )
                 except RemoteProtocolError as exc:

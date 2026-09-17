@@ -30,12 +30,14 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
 
 from .config import Settings
 from .integrity import sha256_file
 from .ledger import UploadRecord
 from .policy import Candidate, verdict
+from .takeout import EDIT_SUFFIX
 
 
 class ReplaceError(RuntimeError):
@@ -51,8 +53,31 @@ class Outcome:
     original_media_key: str | None = None
 
 
-def check_original(item: dict[str, Any], job: UploadRecord) -> None:
+def _same_name(library_name: Any, exported: Path) -> bool:
+    """Whether two filenames name the same photo, ignoring Takeout's edit suffix.
+
+    Takeout exports an edited photo as ``NAME-edited.jpg`` beside the untouched
+    ``NAME.jpg``; Google keeps calling the item ``NAME.jpg``.
+    """
+
+    if not isinstance(library_name, str) or not library_name:
+        return False
+    stem, suffix = exported.stem, exported.suffix
+    if stem.endswith(EDIT_SUFFIX):
+        stem = stem[: -len(EDIT_SUFFIX)]
+    return library_name.casefold() == f"{stem}{suffix}".casefold()
+
+
+def check_original(item: dict[str, Any], job: UploadRecord, sizes: set[int] | None = None) -> None:
     """Accept the sidecar's media key only when the item it names matches the export.
+
+    The exported file's own size is the plain case. `sizes` holds every
+    exported copy's size for this media key, which matters for an edited photo:
+    Takeout exports the edit and the untouched original under one media key,
+    and Google reports the size of the untouched one. Accepting a copy other
+    than the file we encoded costs nothing extra -- the sizes come from the
+    mirror, not another request -- but it must also be the same filename, so a
+    sidecar paired with an unrelated file still cannot pass.
 
     Google's search by content hash is deliberately not used for originals. On
     the live library it missed items whose bytes it held, and for an exact
@@ -62,11 +87,15 @@ def check_original(item: dict[str, Any], job: UploadRecord) -> None:
     if str(item.get("id")) != str(job.media_key):
         raise ReplaceError(f"library returned {item.get('id')} for the sidecar's {job.media_key}")
     exported = job.source.stat().st_size
-    if item.get("size_bytes") != exported:
-        raise ReplaceError(
-            f"library item is {item.get('size_bytes')} bytes but the exported original is "
-            f"{exported}; the sidecar may describe a different file"
-        )
+    reported = item.get("size_bytes")
+    if reported == exported:
+        return
+    if reported in (sizes or set()) and _same_name(item.get("filename"), job.source):
+        return
+    raise ReplaceError(
+        f"library item is {reported} bytes but the exported original is "
+        f"{exported}; the sidecar may describe a different file"
+    )
 
 
 def check_identity(original: dict[str, Any], replacement: dict[str, Any]) -> None:
@@ -141,8 +170,10 @@ class _Batch:
     own job and drops it, so no later step in the batch touches it.
     """
 
-    def __init__(self, library: Any, jobs: list[UploadRecord], settings: Settings, progress: Callable[[str], None]):
+    def __init__(self, library: Any, jobs: list[UploadRecord], settings: Settings,
+                 progress: Callable[[str], None], sizes: dict[str, set[int]] | None = None):
         self.library, self.settings, self.progress = library, settings, progress
+        self.sizes = sizes or {}
         self.jobs = {job.key: job for job in jobs}
         self.outcomes: dict[str, Outcome] = {}
         self.live: dict[str, UploadRecord] = {}
@@ -185,7 +216,7 @@ class _Batch:
                 self.fail(job, f"original could not be read: {item or 'no response'}")
                 continue
             try:
-                check_original(item, job)
+                check_original(item, job, self.sizes.get(job.media_key or ""))
             except ReplaceError as exc:
                 self.fail(job, str(exc))
                 continue
@@ -246,6 +277,7 @@ def replace_batch(
     apply: bool,
     keep_originals: bool,
     progress: Callable[[str], None] = lambda message: None,
+    sizes: dict[str, set[int]] | None = None,
 ) -> dict[str, Outcome]:
     """Replace a batch of jobs; return each job's outcome, keyed by `UploadRecord.key`.
 
@@ -254,7 +286,7 @@ def replace_batch(
     fake in tests. A failure is recorded against its own job and never stops the rest.
     """
 
-    batch = _Batch(library, jobs, settings, progress)
+    batch = _Batch(library, jobs, settings, progress, sizes)
     live, fail = batch.live, batch.fail
 
     # 3-4: the originals.
@@ -344,6 +376,7 @@ def remove_extra_copies(
     settings: Settings,
     apply: bool,
     progress: Callable[[str], None] = lambda message: None,
+    sizes: dict[str, set[int]] | None = None,
 ) -> dict[str, Outcome]:
     """Trash the replacements whose originals are refused; return each job's outcome.
 
@@ -358,7 +391,7 @@ def remove_extra_copies(
     "kept" (the original is not refused), "failed".
     """
 
-    batch = _Batch(library, jobs, settings, progress)
+    batch = _Batch(library, jobs, settings, progress, sizes)
     batch.read_originals()
     for key, job in batch.live.items():
         batch.outcomes[key] = Outcome("kept", "the original is not refused", job.media_key)
