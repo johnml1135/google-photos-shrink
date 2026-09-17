@@ -417,28 +417,38 @@ def run_ffmpeg(
     ignores a kill, and never finishes. Without a bound, that one file stalled
     a 196-video run indefinitely.
 
-    The signal is ffmpeg's own progress stream (`-progress pipe:1`), which
-    reports a frame counter several times a second while it is encoding and
-    goes silent the moment it wedges. The output file is not a usable signal:
-    a wedged encode still dribbles buffered bytes to disk for minutes, which
-    an earlier size-based watchdog read as progress.
+    Progress is the *frame counter advancing*, and nothing else. Two weaker
+    signals were tried against this file and both read as healthy: the output
+    file kept growing (buffered bytes draining, 262KB a minute), and ffmpeg
+    kept printing progress blocks -- 1,368 of them in a minute, every one
+    repeating `frame=40`, `out_time_ms=1584917` while the process burned no
+    CPU. So the values are compared, not their arrival.
 
-    `timeout` remains an outer bound for an encode that reports progress but
-    never ends. A process that will not die is left to the operating system:
-    the run must lose the file, not the queue.
+    `timeout` remains an outer bound for an encode that advances but never
+    ends. A process that will not die is left to the operating system: the run
+    must lose the file, not the queue.
     """
 
     process = subprocess.Popen(
         command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, bufsize=1
     )
     started = time.monotonic()
-    last_progress = [started]
+    last_advance = [started]
 
     def watch_progress() -> None:
         assert process.stdout is not None
+        furthest = -1
         for line in process.stdout:
-            if line.startswith(("frame=", "out_time_ms=", "progress=")):
-                last_progress[0] = time.monotonic()
+            key, _, value = line.strip().partition("=")
+            if key not in ("frame", "out_time_ms"):
+                continue
+            try:
+                position = int(value)
+            except ValueError:
+                continue
+            # frame and out_time_ms both count up; either moving is progress.
+            if position > furthest:
+                furthest, last_advance[0] = position, time.monotonic()
 
     reader = threading.Thread(target=watch_progress, daemon=True)
     reader.start()
@@ -456,8 +466,8 @@ def run_ffmpeg(
             process.wait(timeout=poll_seconds)
         except subprocess.TimeoutExpired:
             now = time.monotonic()
-            if now - last_progress[0] >= stall_seconds:
-                raise abandon(f"reported no progress for {stall_seconds:.0f}s") from None
+            if now - last_advance[0] >= stall_seconds:
+                raise abandon(f"stopped advancing for {stall_seconds:.0f}s") from None
             if now - started >= timeout:
                 raise abandon(f"did not finish within {timeout:.0f}s") from None
             continue

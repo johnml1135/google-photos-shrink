@@ -536,12 +536,21 @@ def test_probe_ignores_an_embedded_cover_thumbnail(
 
 DRIBBLE = (
     "import sys, time\n"
-    "for _ in range(30):\n"
+    "for _ in range(40):\n"
     "    sys.stderr.write('x'); sys.stderr.flush()\n"
-    "    time.sleep(0.2)\n"
+    "    time.sleep(0.1)\n"
 )
 
-# ffmpeg reports a frame counter several times a second while it encodes.
+# What the wedged encode really printed: progress blocks whose frame counter
+# never moved -- 1,368 of them in a minute, all reading frame=40.
+STUCK_FRAMES = (
+    "import time\n"
+    "for _ in range(40):\n"
+    "    print('frame=40'); print('out_time_ms=1584917'); print('progress=continue', flush=True)\n"
+    "    time.sleep(0.1)\n"
+)
+
+# A healthy encode: the counter climbs.
 FRAMES = (
     "import time\n"
     "for i in range(%d):\n"
@@ -571,7 +580,7 @@ class TestRunFfmpeg:
         """The live failure: ffmpeg stopped encoding but held the file open."""
 
         started = time.monotonic()
-        with pytest.raises(media.MediaError, match="reported no progress for"):
+        with pytest.raises(media.MediaError, match="stopped advancing for"):
             media.run_ffmpeg(self._python("import time; time.sleep(30)"), timeout=600,
                              stall_seconds=1, poll_seconds=0.2)
         assert time.monotonic() - started < 15
@@ -579,9 +588,14 @@ class TestRunFfmpeg:
     def test_a_dribble_of_output_is_not_progress(self):
         """What fooled the first watchdog: a wedged encode still flushes bytes."""
 
-        script = DRIBBLE
-        with pytest.raises(media.MediaError, match="reported no progress for"):
-            media.run_ffmpeg(self._python(script), timeout=600, stall_seconds=1, poll_seconds=0.2)
+        with pytest.raises(media.MediaError, match="stopped advancing for"):
+            media.run_ffmpeg(self._python(DRIBBLE), timeout=600, stall_seconds=1, poll_seconds=0.2)
+
+    def test_a_repeated_frame_counter_is_not_progress(self):
+        """What fooled the second watchdog: progress blocks that never advance."""
+
+        with pytest.raises(media.MediaError, match="stopped advancing for"):
+            media.run_ffmpeg(self._python(STUCK_FRAMES), timeout=600, stall_seconds=1, poll_seconds=0.2)
 
     def test_a_reported_frame_counter_keeps_it_alive(self):
         """A long encode must not be cut off while ffmpeg says it is working."""
