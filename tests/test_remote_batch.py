@@ -31,6 +31,7 @@ class Payloads:
     GetItemInfoExt = _payload("GetItemInfoExt", "fDcn4b")
     GetRemoteMatchesByHash = _payload("GetRemoteMatchesByHash", "swbisb")
     MoveToTrash = _payload("MoveToTrash", "XwAOJf")
+    GetTrashPage = _payload("GetTrashPage", "zy0IHe")
     SetItemTimestamp = _payload("SetItemTimestamp", "DaSgWe")
     SetItemDescription = _payload("SetItemDescription", "AQNOFd")
     SetFavorite = _payload("SetFavorite", "fav")
@@ -149,11 +150,13 @@ class TestGetItems:
         assert result["good"]["id"] == "good"
         assert isinstance(result["bad"], RemoteProtocolError)
 
-    def test_a_trashed_item_says_so(self):
+    def test_a_missing_offset_in_the_extended_info_falls_back_to_the_basic_info(self):
+        """The live case: API uploads report no offset in the extended info."""
+
         info, ext = info_and_ext("a")
-        info.trash_timestamp = 123
+        info.timezone_offset, ext.timezone_offset = 0, None
         client = BatchClient(lambda p: info if isinstance(p, Payloads.GetItemInfo) else ext)
-        assert remote_with(client).get_items(["a"])["a"]["trashed"] is True
+        assert remote_with(client).get_items(["a"])["a"]["timezone_offset"] == 0
 
 
 def _hash(data: bytes) -> str:
@@ -239,3 +242,24 @@ class TestTrashMany:
         with pytest.raises(RemoteProtocolError, match="incomplete identity"):
             remote_with(client).trash_many(["d1", ""])
         assert client.requests == []
+
+
+class TestInBin:
+    def _pages(self, *pages):
+        def answer(payload):
+            index = int(payload.args[0] or 0)
+            items, more = pages[index]
+            return SimpleNamespace(
+                items=[SimpleNamespace(dedup_key=key) for key in items],
+                next_page_id=str(index + 1) if more else None,
+            )
+        return BatchClient(answer)
+
+    def test_pages_until_every_key_is_found(self):
+        client = self._pages((["x", "a"], True), (["b"], True), (["never read"], False))
+        assert remote_with(client).in_bin(["a", "b"]) == {"a", "b"}
+        assert len(client.requests) == 2
+
+    def test_reports_only_what_the_bin_holds(self):
+        client = self._pages((["a"], False))
+        assert remote_with(client).in_bin(["a", "b"]) == {"a"}

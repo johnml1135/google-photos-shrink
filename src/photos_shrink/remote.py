@@ -354,6 +354,7 @@ class GooglePhotosRemote:
             "GetItemInfo",
             "GetItemInfoExt",
             "GetRemoteMatchesByHash",
+            "GetTrashPage",
         }
 
     @staticmethod
@@ -491,6 +492,12 @@ class GooglePhotosRemote:
         height = getattr(ext, "res_height", None)
         timestamp = getattr(ext, "timestamp", None)
         timezone_offset = getattr(ext, "timezone_offset", None)
+        if timezone_offset is None:
+            # An API upload with no offset in its EXIF has none in the extended
+            # info, while the basic info reports 0. Taking that 0 lets the
+            # replace step see the mismatch and fix it, instead of being unable
+            # to read the replacement at all.
+            timezone_offset = getattr(info, "timezone_offset", None)
         duration_ms = getattr(info, "video_duration", None)
         if not isinstance(media_key, str) or not media_key or not isinstance(dedup_key, str) or not dedup_key:
             raise RemoteProtocolError("item identity is incomplete")
@@ -1117,6 +1124,27 @@ class GooglePhotosRemote:
             raise RemoteProtocolError("cannot trash items with incomplete identity")
         for start in range(0, len(keys), per_request):
             self._execute(self._payloads.MoveToTrash(keys[start : start + per_request]))
+
+    def in_bin(self, dedup_keys: list[str], *, max_pages: int = 200) -> set[str]:
+        """Which of these dedup keys are in the bin.
+
+        The bin is how a trash is confirmed. Looking the item up does not work:
+        Google refuses item info for anything in the bin, and one library item
+        can answer to more than one media key, so the dedup key is the identity.
+        Pages are read until every key is found or the bin ends.
+        """
+
+        self._load_dependencies()
+        wanted = set(dedup_keys)
+        found: set[str] = set()
+        page_id: str | None = None
+        for _ in range(max_pages):
+            page = self._execute(self._payloads.GetTrashPage(page_id))
+            found |= {getattr(item, "dedup_key", None) for item in getattr(page, "items", []) or []} & wanted
+            page_id = getattr(page, "next_page_id", None)
+            if found == wanted or not page_id:
+                break
+        return found
 
     def close(self) -> None:
         if self._browser is not None:

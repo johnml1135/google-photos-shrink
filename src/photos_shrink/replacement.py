@@ -20,7 +20,7 @@ rest of its batch carries on:
   6. the replacement has the original's capture time, is in every album the
      original is in, and carries its favorite, archive and description --
      fixed where it does not, then re-read to prove the fix took
-  7. `trash_many`, confirmed by re-reading the original
+  7. `trash_many`, confirmed by finding the original's dedup key in the bin
 
 Dry run is the default. Every original also remains in the Takeout export on
 disk, so even a mistake is recoverable by re-upload.
@@ -166,8 +166,8 @@ def replace_batch(
     """Replace a batch of jobs; return each job's outcome, keyed by `UploadRecord.key`.
 
     `library` is any adapter offering get_items, find_uploaded_many,
-    restore_many and trash_many -- the cookie session in production, a fake in
-    tests. A failure is recorded against its own job and never stops the rest.
+    restore_many, trash_many and in_bin -- the cookie session in production, a
+    fake in tests. A failure is recorded against its own job and never stops the rest.
     """
 
     outcomes: dict[str, Outcome] = {}
@@ -281,19 +281,20 @@ def replace_batch(
             outcomes[key] = Outcome("verified_original_kept", "verified, original kept", job.media_key)
         return outcomes
 
-    # 7: trash every original still standing in one call, then confirm each.
+    # 7: trash every original still standing in one call, then confirm each in
+    # the bin. Two jobs can name one library item under different media keys;
+    # it shares one dedup key, so it is trashed once and confirms both.
     if live:
         progress(f"trashing {len(live)} original(s)")
         try:
-            library.trash_many([originals[key]["dedup_key"] for key in live])
+            library.trash_many(list(dict.fromkeys(originals[key]["dedup_key"] for key in live)))
         except Exception as exc:  # noqa: BLE001 - recorded against every job in the call
             for job in list(live.values()):
                 fail(job, f"trash failed: {type(exc).__name__}: {exc}")
     if live:
-        confirmed = library.get_items([job.media_key for job in live.values()])
+        binned = library.in_bin([originals[key]["dedup_key"] for key in live])
         for key, job in list(live.items()):
-            item = confirmed.get(job.media_key)
-            if isinstance(item, dict) and item.get("trashed"):
+            if originals[key]["dedup_key"] in binned:
                 outcomes[key] = Outcome("replaced", "replaced, original trashed", job.media_key)
             else:
                 fail(job, "trash was not confirmed by the server")

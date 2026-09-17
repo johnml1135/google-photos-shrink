@@ -29,8 +29,8 @@ class FakeLibrary:
 
     `items` maps a media key to what `get_items` returns for it. `by_output`
     maps an encoded file's name to the media key its hash resolves to. Fixes
-    are applied to `items` unless `fix_takes` is False; trashing sets
-    `trashed` unless `trash_takes` is False.
+    are applied to `items` unless `fix_takes` is False; trashing puts dedup
+    keys in `bin` unless `trash_takes` is False.
     """
 
     items: dict[str, Any] = field(default_factory=dict)
@@ -39,6 +39,7 @@ class FakeLibrary:
     fix_errors: dict[str, Exception] = field(default_factory=dict)
     trash_takes: bool = True
     trash_error: Exception | None = None
+    bin: set[str] = field(default_factory=set)
     calls: list[tuple] = field(default_factory=list)
 
     def get_items(self, keys):
@@ -75,9 +76,11 @@ class FakeLibrary:
         if self.trash_error:
             raise self.trash_error
         if self.trash_takes:
-            for item in self.items.values():
-                if item["dedup_key"] in dedup_keys:
-                    item["trashed"] = True
+            self.bin.update(dedup_keys)
+
+    def in_bin(self, dedup_keys):
+        self.calls.append(("in_bin", list(dedup_keys)))
+        return set(dedup_keys) & self.bin
 
     def names(self):
         return [call[0] for call in self.calls]
@@ -153,7 +156,7 @@ class TestWholeBatch:
         outcomes = run(library, [job], tmp_path)
         assert outcomes[job.key].status == "replaced"
         assert library.trashed() == ["dedup-ORIG-one"]
-        assert library.names() == ["get_items", "find_uploaded_many", "get_items", "trash_many", "get_items"]
+        assert library.names() == ["get_items", "find_uploaded_many", "get_items", "trash_many", "in_bin"]
 
     def test_a_batch_costs_the_same_calls_as_one_item(self, tmp_path):
         """The point of batching: requests do not grow with the batch."""
@@ -163,7 +166,7 @@ class TestWholeBatch:
         library = library_for(*names)
         outcomes = run(library, jobs, tmp_path)
         assert {o.status for o in outcomes.values()} == {"replaced"}
-        assert library.names() == ["get_items", "find_uploaded_many", "get_items", "trash_many", "get_items"]
+        assert library.names() == ["get_items", "find_uploaded_many", "get_items", "trash_many", "in_bin"]
         assert len(library.trashed()) == 20
 
     def test_one_failure_does_not_stop_the_rest(self, tmp_path):
@@ -342,7 +345,7 @@ class TestFixes:
         assert outcome.status == "replaced"
         assert library.names() == [
             "get_items", "find_uploaded_many", "get_items",
-            "restore_many", "get_items", "trash_many", "get_items",
+            "restore_many", "get_items", "trash_many", "in_bin",
         ]
         assert library.calls[3] == ("restore_many", [("REPL-one", ["timestamp"])])
         assert library.calls[4] == ("get_items", ["REPL-one"])
@@ -390,6 +393,17 @@ class TestFixes:
 
 
 class TestTrash:
+    def test_two_keys_for_one_library_item_trash_once_and_both_confirm(self, tmp_path):
+        """The live IMG_2004 case: two sidecars, two media keys, one item."""
+
+        first = make_job(tmp_path, "first", media_key="ORIG-first")
+        second = make_job(tmp_path, "second", media_key="ORIG-second")
+        library = library_for("first", "second")
+        library.items["ORIG-second"]["dedup_key"] = "dedup-ORIG-first"
+        outcomes = run(library, [first, second], tmp_path)
+        assert {outcomes[first.key].status, outcomes[second.key].status} == {"replaced"}
+        assert library.trashed() == ["dedup-ORIG-first"]
+
     def test_an_unconfirmed_trash_fails(self, tmp_path):
         job = make_job(tmp_path)
         library = library_for("one", trash_takes=False)
