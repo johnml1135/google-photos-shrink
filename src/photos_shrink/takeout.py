@@ -60,6 +60,7 @@ class TakeoutRecord:
     people: tuple[str, ...] = ()
     url: str | None = None
     media_key: str | None = None
+    origin: str | None = None
     sha256: str | None = None
 
     @property
@@ -206,6 +207,13 @@ def parse_sidecar(path: str | Path) -> dict[str, Any]:
     url = url if isinstance(url, str) and url.startswith("https://") else None
     media_key = url.rstrip("/").rsplit("/", 1)[-1] if url else None
 
+    # How the item entered the library: "mobileUpload", "webUpload",
+    # "fromPartnerSharing", "fromSharedAlbum" and so on -- the one key of
+    # `googlePhotosOrigin`. A photo shared in by someone else costs their
+    # storage, not this account's.
+    origins = raw.get("googlePhotosOrigin")
+    origin = next(iter(origins), None) if isinstance(origins, dict) else None
+
     title = raw.get("title")
     return {
         "title": title if isinstance(title, str) and title else None,
@@ -215,6 +223,7 @@ def parse_sidecar(path: str | Path) -> dict[str, Any]:
         "people": tuple(people),
         "url": url,
         "media_key": media_key,
+        "origin": origin if isinstance(origin, str) else None,
     }
 
 
@@ -269,6 +278,7 @@ def scan(root: str | Path, *, compute_hash: bool = False) -> Iterator[TakeoutRec
                 "people": (),
                 "url": None,
                 "media_key": None,
+                "origin": None,
             }
             if sidecar is not None:
                 try:
@@ -309,6 +319,7 @@ class MirrorEntry:
     longitude: float | None = None
     edited: bool = False
     has_sidecar: bool = False
+    origin: str | None = None
 
     @property
     def uploadable(self) -> bool:
@@ -353,6 +364,7 @@ def mirror(root: str | os.PathLike[str]) -> list[MirrorEntry]:
                 longitude=best.longitude,
                 edited=best.edited,
                 has_sidecar=best.sidecar is not None,
+                origin=best.origin,
             )
         )
     for record in orphans:
@@ -371,6 +383,7 @@ def mirror(root: str | os.PathLike[str]) -> list[MirrorEntry]:
                 longitude=record.longitude,
                 edited=record.edited,
                 has_sidecar=record.sidecar is not None,
+                origin=record.origin,
             )
         )
     entries.sort(key=lambda e: e.size_bytes, reverse=True)

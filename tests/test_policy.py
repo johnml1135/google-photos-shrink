@@ -110,6 +110,32 @@ class TestCandidateFromMirrorEntry:
         entry = mirror_entry(taken_timestamp_ms=None)
         assert Candidate.from_mirror_entry(entry).timestamp_ms is None
 
+    def test_a_partner_shared_or_shared_album_origin_is_shared_in(self):
+        for origin in ("fromPartnerSharing", "fromSharedAlbum"):
+            assert Candidate.from_mirror_entry(mirror_entry(origin=origin)).shared_origin is True
+
+    def test_this_accounts_own_uploads_are_not_shared_in(self):
+        for origin in ("mobileUpload", "webUpload", "picasa", None):
+            assert Candidate.from_mirror_entry(mirror_entry(origin=origin)).shared_origin is False
+
+
+class TestCandidateFromEncodeRow:
+    ROW = {"source": "G:/x/IMG_1.jpg", "media_key": "K", "taken_timestamp_ms": "1600000000000", "saved_percent": "88.5"}
+
+    def test_maps_the_row(self):
+        candidate = Candidate.from_encode_row(self.ROW, kind="photo", origin="mobileUpload")
+        assert (candidate.media_key, candidate.filename, candidate.timestamp_ms) == ("K", "IMG_1.jpg", 1_600_000_000_000)
+        assert candidate.saved_percent == 88.5
+        assert candidate.shared_origin is False
+
+    def test_a_partner_shared_row_is_refused(self, tmp_path):
+        candidate = Candidate.from_encode_row(self.ROW, kind="photo", origin="fromPartnerSharing")
+        assert verdict(settings_for(tmp_path), candidate) == "shared_to_you"
+
+    def test_blank_values_are_unknown_not_zero(self):
+        candidate = Candidate.from_encode_row({"source": "a.jpg"}, kind="photo", origin=None)
+        assert candidate.media_key is None and candidate.timestamp_ms is None and candidate.saved_percent is None
+
 
 class TestVerdict:
     def test_an_ordinary_candidate_is_allowed(self, tmp_path):
@@ -245,6 +271,7 @@ class TestRefusalVocabulary:
         in_2019 = 1_560_000_000_000
         cases = [
             ordinary_candidate(media_key=None),
+            ordinary_candidate(shared_origin=True),
             ordinary_candidate(kind="video"),
             ordinary_candidate(shared_album=True),
             ordinary_candidate(space_consuming=False),

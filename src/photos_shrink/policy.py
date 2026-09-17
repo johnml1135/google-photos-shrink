@@ -17,11 +17,16 @@ known", not "zero". Getting that backwards would refuse the entire library.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
     from .config import Settings
     from .takeout import MirrorEntry
+
+# Sidecar origins for photos someone else put into this library. They cost the
+# sharer's storage, so replacing one only adds a copy on this account's.
+SHARED_ORIGINS = frozenset({"fromPartnerSharing", "fromSharedAlbum"})
 
 
 @dataclass(frozen=True)
@@ -39,6 +44,9 @@ class Candidate:
     # can be flagged as consuming no quota while still reporting a byte size.
     # Both must be carried or the refusal silently stops firing.
     space_consuming: bool | None = None  # None when not yet known
+    # Known only from a Takeout sidecar; the live library does not report it,
+    # but such an item consumes no quota there and is refused on that instead.
+    shared_origin: bool = False
 
     @classmethod
     def from_library_item(cls, item: dict[str, Any]) -> Candidate:
@@ -78,6 +86,29 @@ class Candidate:
             timestamp_ms=entry.taken_timestamp_ms,
             space_taken_bytes=None,
             shared_album=False,
+            shared_origin=entry.origin in SHARED_ORIGINS,
+        )
+
+    @classmethod
+    def from_encode_row(cls, row: dict[str, str], *, kind: str, origin: str | None) -> Candidate:
+        """Build a candidate from a row of the encode report, for the uploader.
+
+        The report was gated when it was written, but by the configuration and
+        policy of that run; asking again at upload time means a refusal added
+        since -- or an origin the encoder never checked -- still applies.
+        """
+
+        taken = row.get("taken_timestamp_ms") or ""
+        percent = row.get("saved_percent") or ""
+        return cls(
+            media_key=row.get("media_key") or None,
+            filename=Path(row.get("source") or "").name,
+            kind=kind,
+            timestamp_ms=int(taken) if taken.isdigit() else None,
+            space_taken_bytes=None,
+            shared_album=False,
+            saved_percent=float(percent) if percent else None,
+            shared_origin=origin in SHARED_ORIGINS,
         )
 
 
@@ -104,7 +135,7 @@ def _consumes_no_quota(candidate: Candidate) -> bool:
 def verdict(settings: Settings, candidate: Candidate) -> str | None:
     """Return why this photo must not be replaced, or None when it may be.
 
-    Refusal tokens: "no_media_key", "non_photo", "shared_album",
+    Refusal tokens: "no_media_key", "shared_to_you", "non_photo", "shared_album",
     "non_space_consuming", whatever `Settings.exclusion_reason` returns
     ("excluded_name", "missing_capture_date", "invalid_capture_date",
     "excluded_date"), and "insufficient_savings".
@@ -114,6 +145,8 @@ def verdict(settings: Settings, candidate: Candidate) -> str | None:
         # Nothing downstream -- encode, upload, replace -- can identify the
         # original later without one.
         return "no_media_key"
+    if candidate.shared_origin:
+        return "shared_to_you"
     if settings.run.get("photos_only", False) and candidate.kind != "photo":
         return "non_photo"
     if settings.run["skip_shared"] and candidate.shared_album:
@@ -142,6 +175,7 @@ def verdict(settings: Settings, candidate: Candidate) -> str | None:
 # test instead of silently reaching a report as a bare identifier.
 REFUSAL_TEXT = {
     "no_media_key": "no media key: the original could not be identified later",
+    "shared_to_you": "shared into this library by someone else: it costs their storage, not yours",
     "missing_capture_date": "no timestamp: would be dated 'today' on upload",
     "invalid_capture_date": "capture date could not be parsed",
     "excluded_date": "excluded by configured date range",

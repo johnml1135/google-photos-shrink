@@ -17,7 +17,7 @@ import sys
 import time
 from pathlib import Path
 
-from photos_shrink import media
+from photos_shrink import media, policy, takeout
 from photos_shrink.config import load_config
 from photos_shrink.integrity import sha256_file
 from photos_shrink.ledger import UploadJournal, UploadRecord
@@ -26,6 +26,18 @@ from photos_shrink.photos_api import (
     PhotosApiError,
     load_client_credentials,
 )
+
+
+def load_origins(mirror_path: Path) -> dict[str, str] | None:
+    """Media key -> sidecar origin from the mirror, or None if it predates origins."""
+
+    if not mirror_path.exists():
+        return None
+    with open(mirror_path, encoding="utf-8") as handle:
+        reader = csv.DictReader(handle)
+        if "origin" not in (reader.fieldnames or []):
+            return None
+        return {row["media_key"]: row["origin"] for row in reader if row.get("media_key")}
 
 
 def verify_item(item: dict, source: Path, ffprobe: str) -> tuple[str, str]:
@@ -66,6 +78,7 @@ def main() -> int:
     parser.add_argument("--limit", type=int, default=0, help="0 uploads every encoded row")
     parser.add_argument("--album", default=None, help="Create/use an album for the replacements")
     parser.add_argument("--journal", type=Path, default=None)
+    parser.add_argument("--mirror", type=Path, default=None, help="Defaults to <data_dir>/mirror.csv")
     parser.add_argument("--pause", type=float, default=1.0, help="Seconds between uploads")
     parser.add_argument("--dry-run", action="store_true", help="List what would upload, then stop")
     parser.add_argument(
@@ -86,6 +99,34 @@ def main() -> int:
 
     with open(args.report, encoding="utf-8") as handle:
         rows = [r for r in csv.DictReader(handle) if r["status"] == "encoded"]
+
+    # Ask the gate again before spending quota. The report was gated by the
+    # encoder of its day, which never checked where a photo came from: 194
+    # partner-shared photos were uploaded, each a new copy on this account's
+    # storage of a photo that cost it nothing.
+    mirror_path = args.mirror or Path(settings.run["data_dir"]) / "mirror.csv"
+    origins = load_origins(mirror_path)
+    if origins is None:
+        print(
+            f"{mirror_path} has no origin column. Re-run tools/takeout_mirror.py so uploads "
+            "can refuse photos shared in by someone else.",
+            file=sys.stderr,
+        )
+        return 2
+    refused: dict[str, int] = {}
+    allowed = []
+    for row in rows:
+        kind = takeout.classify(Path(row["source"])) or "unknown"
+        # Through the module: `verdict` is a local name in this function.
+        candidate = policy.Candidate.from_encode_row(row, kind=kind, origin=origins.get(row.get("media_key", "")))
+        token = policy.verdict(settings, candidate)
+        if token:
+            refused[token] = refused.get(token, 0) + 1
+        else:
+            allowed.append(row)
+    for token, count in sorted(refused.items()):
+        print(f"  refused {count:,}: {policy.explain(token)}", flush=True)
+    rows = allowed
     if args.limit:
         rows = rows[: args.limit]
     if not rows:

@@ -111,6 +111,18 @@ class TestParseSidecar:
         assert fields["latitude"] == pytest.approx(47.6)
         assert fields["people"] == ("Ada",)
 
+    def test_reads_how_the_item_entered_the_library(self, tmp_path):
+        path = tmp_path / "IMG_0001.jpg.json"
+        payload = sidecar_payload()
+        payload["googlePhotosOrigin"] = {"fromPartnerSharing": {}}
+        write(path, payload)
+        assert takeout.parse_sidecar(path)["origin"] == "fromPartnerSharing"
+
+    def test_no_origin_is_none(self, tmp_path):
+        path = tmp_path / "IMG_0001.jpg.json"
+        write(path, sidecar_payload())
+        assert takeout.parse_sidecar(path)["origin"] is None
+
     def test_zero_coordinates_are_treated_as_absent(self, tmp_path):
         path = tmp_path / "IMG_0001.jpg.json"
         write(path, sidecar_payload(lat=0.0, lon=0.0))

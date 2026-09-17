@@ -36,6 +36,7 @@ FIELDS = [
     "latitude",
     "longitude",
     "url",
+    "origin",
     "path",
 ]
 
@@ -81,6 +82,7 @@ def main() -> int:
                     "latitude": entry.latitude if entry.latitude is not None else "",
                     "longitude": entry.longitude if entry.longitude is not None else "",
                     "url": entry.url or "",
+                    "origin": entry.origin or "",
                     "path": str(entry.path),
                 }
             )
