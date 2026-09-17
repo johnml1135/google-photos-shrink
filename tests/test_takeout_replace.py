@@ -1,12 +1,9 @@
 """Tests for the only Takeout code that destroys anything.
 
-`replace_one` holds nine refusal points in a fixed order (see
-`photos_shrink.replacement`'s module docstring). Testing only the pure
-helper functions -- confirm_original, check_identity, output_info_for -- would
-prove each check works in isolation but say nothing about the order they run
-in. The tests below use a fake library adapter that records every call it
-receives, so each test can assert not just "this raised" but "the mutating
-calls after it were never reached".
+`replace_batch` works a whole batch per request, so a failure must stay with
+its own item: these tests use a fake library that records every call, and
+assert both what each item's outcome was and that nothing destructive reached
+an item that failed a check.
 """
 
 from __future__ import annotations
@@ -17,73 +14,76 @@ from typing import Any
 
 import pytest
 
-from photos_shrink import replacement as replacement_module
 from photos_shrink.config import load_config
+from photos_shrink.integrity import sha256_file
 from photos_shrink.ledger import UploadRecord
-from photos_shrink.replacement import (
-    ReplaceError,
-    check_identity,
-    confirm_original,
-    output_info_for,
-    replace_one,
-)
+from photos_shrink.remote import RemoteProtocolError
+from photos_shrink.replacement import needed_fixes, replace_batch
 
-MUTATING_CALLS = {"restore_metadata", "verify_replacement", "trash", "is_trashed"}
+ORIGINAL_BYTES = b"original bytes"
 
 
 @dataclass
 class FakeLibrary:
-    """Records every call so tests can assert on order, not just outcome.
+    """A library adapter that records calls.
 
-    `by_hash` maps a file's basename to the library item `find_uploaded`
-    should resolve it to. `items` maps a media key to what `get_item` returns
-    for it. `verify_error` and `trash_confirms` let a test make one specific
-    step fail without touching the others.
+    `items` maps a media key to what `get_items` returns for it. `by_output`
+    maps an encoded file's name to the media key its hash resolves to. Fixes
+    are applied to `items` unless `fix_takes` is False; trashing sets
+    `trashed` unless `trash_takes` is False.
     """
 
-    by_hash: dict[str, dict[str, Any]] = field(default_factory=dict)
-    items: dict[str, dict[str, Any]] = field(default_factory=dict)
-    verify_error: Exception | None = None
-    trash_confirms: bool = True
-    require_trust: bool = False
-    trusted: set[str] = field(default_factory=set)
+    items: dict[str, Any] = field(default_factory=dict)
+    by_output: dict[str, Any] = field(default_factory=dict)
+    fix_takes: bool = True
+    fix_errors: dict[str, Exception] = field(default_factory=dict)
+    trash_takes: bool = True
+    trash_error: Exception | None = None
     calls: list[tuple] = field(default_factory=list)
 
-    def find_uploaded(self, path):
-        result = self.by_hash.get(Path(path).name)
-        self.calls.append(("find_uploaded", Path(path).name, result))
+    def get_items(self, keys):
+        self.calls.append(("get_items", list(keys)))
+        return {key: self.items[key] for key in keys if key in self.items}
+
+    def find_uploaded_many(self, paths):
+        self.calls.append(("find_uploaded_many", [Path(p).name for p in paths]))
+        result = {}
+        for path in paths:
+            found = self.by_output.get(Path(path).name)
+            if isinstance(found, str):
+                found = {"id": found, "dedup_key": self.items[found]["dedup_key"]}
+            result[path] = found
         return result
 
-    def get_item(self, media_key):
-        result = self.items.get(media_key, {})
-        self.calls.append(("get_item", media_key, result))
-        return result
+    def restore_many(self, fixes):
+        self.calls.append(("restore_many", [(f["replacement"]["id"], sorted(k for k in f if k != "replacement")) for f in fixes]))
+        if self.fix_takes:
+            for fix in fixes:
+                item = self.items[fix["replacement"]["id"]]
+                if fix["replacement"]["id"] in self.fix_errors:
+                    continue
+                if "timestamp" in fix:
+                    item["timestamp_ms"], item["timezone_offset"] = fix["timestamp"]
+                item["metadata"]["albums"] = item["metadata"]["albums"] + list(fix.get("albums", []))
+                for key in ("favorite", "archived", "description"):
+                    if key in fix:
+                        item["metadata"][key] = fix[key]
+        return dict(self.fix_errors)
 
-    def trust_replacement(self, media_key):
-        self.calls.append(("trust_replacement", media_key))
-        self.trusted.add(media_key)
+    def trash_many(self, dedup_keys):
+        self.calls.append(("trash_many", list(dedup_keys)))
+        if self.trash_error:
+            raise self.trash_error
+        if self.trash_takes:
+            for item in self.items.values():
+                if item["dedup_key"] in dedup_keys:
+                    item["trashed"] = True
 
-    def restore_metadata(self, original, replacement):
-        self.calls.append(("restore_metadata", original.get("id"), replacement.get("id")))
+    def names(self):
+        return [call[0] for call in self.calls]
 
-    def verify_replacement(self, original, replacement, info):
-        self.calls.append(("verify_replacement", original.get("id"), replacement.get("id")))
-        if self.require_trust and replacement.get("id") not in self.trusted:
-            # What the live session did: an API upload's ownership is not
-            # readable over the web client, so it is refused unless trusted.
-            raise RuntimeError("replacement has an unsafe metadata state")
-        if self.verify_error is not None:
-            raise self.verify_error
-
-    def trash(self, item):
-        self.calls.append(("trash", item.get("id")))
-
-    def is_trashed(self, item):
-        self.calls.append(("is_trashed", item.get("id")))
-        return self.trash_confirms
-
-    def names(self) -> list[str]:
-        return [c[0] for c in self.calls]
+    def trashed(self):
+        return [key for call in self.calls if call[0] == "trash_many" for key in call[1]]
 
 
 def settings_for(tmp_path: Path, **run):
@@ -96,356 +96,324 @@ def settings_for(tmp_path: Path, **run):
 
 
 def make_item(item_id: str, **overrides) -> dict[str, Any]:
+    metadata = {"albums": [], "favorite": False, "archived": False, "description": None}
+    metadata.update(overrides.pop("metadata", {}))
     item = {
         "id": item_id,
         "dedup_key": f"dedup-{item_id}",
         "filename": "IMG_1.jpg",
         "kind": "photo",
         "timestamp_ms": 1_700_000_000_000,
-        "size_bytes": len(b"original bytes"),  # matches make_job's source
+        "timezone_offset": -14_400_000,
+        "size_bytes": len(ORIGINAL_BYTES),
         "space_taken_bytes": 12345,
-        "metadata": {"albums": []},
+        "metadata": metadata,
+        "skip_reason": None,
+        "trashed": False,
     }
     item.update(overrides)
     return item
 
 
-def make_job(tmp_path: Path, *, media_key="ORIG1", output_sha256=None) -> UploadRecord:
-    source = tmp_path / "IMG_1.jpg"
-    source.write_bytes(b"original bytes")
-    output = tmp_path / "out.avif"
-    output.write_bytes(b"encoded bytes")
+def make_job(tmp_path: Path, name: str = "one", *, media_key: str | None = "ORIG-one", record_hash: bool = True) -> UploadRecord:
+    folder = tmp_path / name
+    folder.mkdir(exist_ok=True)
+    source = folder / "IMG_1.jpg"
+    source.write_bytes(ORIGINAL_BYTES)
+    output = folder / f"{name}.avif"
+    output.write_bytes(f"encoded {name}".encode())
     return UploadRecord(
-        source=source,
-        output=output,
-        media_key=media_key,
-        output_sha256=output_sha256,
+        source=source, output=output, media_key=media_key,
+        output_sha256=sha256_file(output) if record_hash else None,
     )
 
 
-def patch_probe(monkeypatch):
-    monkeypatch.setattr(replacement_module.media, "probe", lambda *a, **k: {"width": 10, "height": 8})
+def library_for(*names: str, **kwargs) -> FakeLibrary:
+    """A library where each named job's original and replacement already agree."""
+
+    library = FakeLibrary(**kwargs)
+    for name in names:
+        library.items[f"ORIG-{name}"] = make_item(f"ORIG-{name}")
+        library.items[f"REPL-{name}"] = make_item(f"REPL-{name}", size_bytes=99)
+        library.by_output[f"{name}.avif"] = f"REPL-{name}"
+    return library
 
 
-# --- Unit tests for the pure helpers -----------------------------------------
+def run(library, jobs, tmp_path, *, apply=True, keep_originals=False, **run_settings):
+    return replace_batch(
+        library, jobs, settings=settings_for(tmp_path, **run_settings),
+        apply=apply, keep_originals=keep_originals,
+    )
 
 
-class TestConfirmOriginal:
-    def _source(self, tmp_path):
-        source = tmp_path / "IMG_1.jpg"
-        source.write_bytes(b"original bytes")
-        return source
+class TestWholeBatch:
+    def test_a_matching_item_is_trashed_and_confirmed(self, tmp_path):
+        job = make_job(tmp_path)
+        library = library_for("one")
+        outcomes = run(library, [job], tmp_path)
+        assert outcomes[job.key].status == "replaced"
+        assert library.trashed() == ["dedup-ORIG-one"]
+        assert library.names() == ["get_items", "find_uploaded_many", "get_items", "trash_many", "get_items"]
 
-    def test_accepts_the_sidecar_key_when_id_and_size_agree(self, tmp_path):
-        library = FakeLibrary(items={"KEY1": make_item("KEY1")})
-        assert confirm_original(library, self._source(tmp_path), "KEY1")["id"] == "KEY1"
+    def test_a_batch_costs_the_same_calls_as_one_item(self, tmp_path):
+        """The point of batching: requests do not grow with the batch."""
 
-    def test_never_searches_by_content_hash(self, tmp_path):
-        """The live hash search missed held items and returned the wrong copy of a duplicate."""
+        names = [f"n{i}" for i in range(20)]
+        jobs = [make_job(tmp_path, name, media_key=f"ORIG-{name}") for name in names]
+        library = library_for(*names)
+        outcomes = run(library, jobs, tmp_path)
+        assert {o.status for o in outcomes.values()} == {"replaced"}
+        assert library.names() == ["get_items", "find_uploaded_many", "get_items", "trash_many", "get_items"]
+        assert len(library.trashed()) == 20
 
-        library = FakeLibrary(items={"KEY1": make_item("KEY1")})
-        confirm_original(library, self._source(tmp_path), "KEY1")
-        assert library.names() == ["get_item"]
+    def test_one_failure_does_not_stop_the_rest(self, tmp_path):
+        good = make_job(tmp_path, "good", media_key="ORIG-good")
+        bad = make_job(tmp_path, "bad", media_key="ORIG-bad")
+        library = library_for("good", "bad")
+        library.items["ORIG-bad"]["size_bytes"] = 999
+        outcomes = run(library, [good, bad], tmp_path)
+        assert outcomes[good.key].status == "replaced"
+        assert outcomes[bad.key].status == "failed"
+        assert library.trashed() == ["dedup-ORIG-good"]
 
-    def test_refuses_when_the_size_differs(self, tmp_path):
+    def test_dry_run_reads_but_never_fixes_or_trashes(self, tmp_path):
+        job = make_job(tmp_path)
+        library = library_for("one")
+        library.items["REPL-one"]["timestamp_ms"] = 1
+        outcomes = run(library, [job], tmp_path, apply=False)
+        assert outcomes[job.key].status == "would_replace"
+        assert outcomes[job.key].detail == "would fix capture time, then trash"
+        assert "restore_many" not in library.names()
+        assert "trash_many" not in library.names()
+
+    def test_keep_originals_fixes_but_never_trashes(self, tmp_path):
+        job = make_job(tmp_path)
+        library = library_for("one")
+        library.items["REPL-one"]["timestamp_ms"] = 1
+        outcomes = run(library, [job], tmp_path, keep_originals=True)
+        assert outcomes[job.key].status == "verified_original_kept"
+        assert "restore_many" in library.names()
+        assert "trash_many" not in library.names()
+
+
+class TestOriginal:
+    def test_the_sidecar_key_is_accepted_when_id_and_size_agree(self, tmp_path):
+        job = make_job(tmp_path)
+        outcomes = run(library_for("one"), [job], tmp_path)
+        assert outcomes[job.key].status == "replaced"
+
+    def test_a_size_mismatch_fails_before_the_replacement_is_looked_up(self, tmp_path):
         """A sidecar paired with the wrong file names an item of another size."""
 
-        library = FakeLibrary(items={"KEY1": make_item("KEY1", size_bytes=999)})
-        with pytest.raises(ReplaceError, match="may describe a different file"):
-            confirm_original(library, self._source(tmp_path), "KEY1")
+        job = make_job(tmp_path)
+        library = library_for("one")
+        library.items["ORIG-one"]["size_bytes"] = 999
+        outcomes = run(library, [job], tmp_path)
+        assert outcomes[job.key].status == "failed"
+        assert "may describe a different file" in outcomes[job.key].detail
+        assert library.calls[1] == ("find_uploaded_many", [])
+        assert library.trashed() == []
 
-    def test_refuses_when_the_size_is_unknown(self, tmp_path):
-        library = FakeLibrary(items={"KEY1": make_item("KEY1", size_bytes=None)})
-        with pytest.raises(ReplaceError, match="may describe a different file"):
-            confirm_original(library, self._source(tmp_path), "KEY1")
+    def test_another_id_fails(self, tmp_path):
+        job = make_job(tmp_path)
+        library = library_for("one")
+        library.items["ORIG-one"]["id"] = "SOMEONE_ELSE"
+        assert run(library, [job], tmp_path)[job.key].status == "failed"
+        assert library.trashed() == []
 
-    def test_refuses_when_get_item_returns_another_id(self, tmp_path):
-        library = FakeLibrary(items={"KEY1": make_item("SOMEONE_ELSE")})
-        with pytest.raises(ReplaceError, match="get_item returned"):
-            confirm_original(library, self._source(tmp_path), "KEY1")
+    def test_an_unreadable_original_fails(self, tmp_path):
+        job = make_job(tmp_path)
+        library = library_for("one")
+        library.items["ORIG-one"] = RemoteProtocolError("item identity is incomplete")
+        outcome = run(library, [job], tmp_path)[job.key]
+        assert outcome.status == "failed"
+        assert "item identity is incomplete" in outcome.detail
 
-    def test_refuses_when_the_exported_original_is_missing(self, tmp_path):
-        library = FakeLibrary(items={"KEY1": make_item("KEY1")})
-        with pytest.raises(ReplaceError, match="missing from the export"):
-            confirm_original(library, tmp_path / "gone.jpg", "KEY1")
-        assert library.calls == []
+    def test_a_missing_export_never_touches_the_library(self, tmp_path):
+        job = make_job(tmp_path)
+        job.source.unlink()
+        library = library_for("one")
+        assert run(library, [job], tmp_path)[job.key].status == "failed"
+        assert library.calls[0] == ("get_items", [])
 
-
-class TestCheckIdentity:
-    def test_refuses_an_identical_id(self):
-        with pytest.raises(ReplaceError, match="not distinct"):
-            check_identity({"id": "A"}, {"id": "A"})
-
-    def test_refuses_a_shared_dedup_key(self):
-        with pytest.raises(ReplaceError, match="deduplication identity"):
-            check_identity({"id": "A", "dedup_key": "D"}, {"id": "B", "dedup_key": "D"})
-
-    def test_refuses_an_empty_replacement(self):
-        with pytest.raises(ReplaceError):
-            check_identity({"id": "A"}, {})
-
-    def test_accepts_a_distinct_replacement(self):
-        check_identity({"id": "A", "dedup_key": "D1"}, {"id": "B", "dedup_key": "D2"})
-
-class TestOutputInfo:
-    def test_supplies_the_hash_and_path_verification_requires(self, tmp_path, monkeypatch):
-        from photos_shrink.integrity import sha256_file
-
-        patch_probe(monkeypatch)
-        output = tmp_path / "out.avif"
-        output.write_bytes(b"encoded bytes")
-        record = UploadRecord()
-        info = output_info_for(record, output, "ffprobe")
-        assert info["path"] == str(output)
-        assert info["sha256"] == sha256_file(output)
-        assert info["size_bytes"] == output.stat().st_size
-
-    def test_refuses_when_the_encoded_file_changed_since_upload(self, tmp_path, monkeypatch):
-        monkeypatch.setattr(replacement_module.media, "probe", lambda *a, **k: {})
-        output = tmp_path / "out.avif"
-        output.write_bytes(b"different bytes now")
-        record = UploadRecord(output_sha256="a" * 64)
-        with pytest.raises(ReplaceError, match="no longer matches"):
-            output_info_for(record, output, "ffprobe")
-
-
-# --- Ordering tests: the point of the whole refactor -------------------------
-
-
-class TestReplaceOneOrder:
-    def test_no_media_key_touches_the_library_at_all(self, tmp_path):
-        settings = settings_for(tmp_path)
+    def test_no_media_key_fails(self, tmp_path):
         job = make_job(tmp_path, media_key=None)
-        library = FakeLibrary()
-        with pytest.raises(ReplaceError, match="no media key"):
-            replace_one(library, job, settings=settings, ffprobe="ffprobe", apply=True, keep_originals=False)
-        assert library.calls == []
+        assert run(library_for("one"), [job], tmp_path)[job.key].status == "failed"
 
-    def test_size_mismatch_stops_before_the_replacement_is_looked_up(self, tmp_path):
-        settings = settings_for(tmp_path)
-        job = make_job(tmp_path, media_key="KEY1")
-        library = FakeLibrary(items={"KEY1": make_item("KEY1", size_bytes=999)})
-        with pytest.raises(ReplaceError, match="may describe a different file"):
-            replace_one(library, job, settings=settings, ffprobe="ffprobe", apply=True, keep_originals=False)
-        assert library.names() == ["get_item"]
+    def test_an_item_that_costs_no_quota_is_refused(self, tmp_path):
+        job = make_job(tmp_path)
+        library = library_for("one")
+        library.items["ORIG-one"]["space_taken_bytes"] = 0
+        outcome = run(library, [job], tmp_path)[job.key]
+        assert (outcome.status, outcome.detail) == ("refused", "non_space_consuming")
+        assert library.trashed() == []
 
-    def test_a_mismatched_item_id_is_refused(self, tmp_path):
-        settings = settings_for(tmp_path)
-        job = make_job(tmp_path, media_key="KEY1")
-        library = FakeLibrary(items={"KEY1": make_item("SOMETHING_ELSE")})
-        with pytest.raises(ReplaceError, match="get_item returned"):
-            replace_one(library, job, settings=settings, ffprobe="ffprobe", apply=True, keep_originals=False)
-        assert "restore_metadata" not in library.names()
-        assert "trash" not in library.names()
+    @pytest.mark.parametrize("flag, token", [
+        ("motion photo association is unsupported", "motion_photo"),
+        ("shared item", "shared_item"),
+        ("partial upload", "partial_upload"),
+    ])
+    def test_originals_that_would_lose_something_are_refused(self, tmp_path, flag, token):
+        job = make_job(tmp_path)
+        library = library_for("one")
+        library.items["ORIG-one"]["skip_reason"] = flag
+        outcome = run(library, [job], tmp_path)[job.key]
+        assert (outcome.status, outcome.detail) == ("refused", token)
 
-    def test_gate_refusal_never_reaches_restore_metadata(self, tmp_path):
-        """A refused item must not even have its replacement looked up."""
+    def test_an_unreadable_owner_is_not_a_refusal(self, tmp_path):
+        """The original is in this account's Takeout and costs its quota."""
 
-        settings = settings_for(tmp_path, skip_shared=True)
-        job = make_job(tmp_path, media_key="KEY1")
-        original = make_item("KEY1", metadata={"albums": [{"id": "a", "shared": True}]})
-        library = FakeLibrary(items={"KEY1": original})
-        outcome = replace_one(library, job, settings=settings, ffprobe="ffprobe", apply=True, keep_originals=False)
-        assert outcome.status == "refused"
-        assert outcome.detail == "shared_album"
-        # The gate refused before the replacement's content hash was resolved.
-        assert library.names() == ["get_item"]
-        assert "restore_metadata" not in library.names()
-        assert "trash" not in library.names()
+        job = make_job(tmp_path)
+        library = library_for("one")
+        library.items["ORIG-one"]["skip_reason"] = "ownership is unknown"
+        assert run(library, [job], tmp_path)[job.key].status == "replaced"
 
-    def test_replacement_not_found_leaves_restore_metadata_uncalled(self, tmp_path):
-        settings = settings_for(tmp_path)
-        job = make_job(tmp_path, media_key="KEY1")
-        original = make_item("KEY1")
-        library = FakeLibrary(items={"KEY1": original})
-        # find_uploaded(output) resolves to nothing because "out.avif" is not in by_hash.
-        with pytest.raises(ReplaceError, match="not found by content hash"):
-            replace_one(library, job, settings=settings, ffprobe="ffprobe", apply=True, keep_originals=False)
-        assert "restore_metadata" not in library.names()
-        assert "trash" not in library.names()
+    def test_an_unknown_favorite_is_refused_even_behind_an_ownership_flag(self, tmp_path):
+        job = make_job(tmp_path)
+        library = library_for("one")
+        library.items["ORIG-one"]["skip_reason"] = "ownership is unknown"
+        library.items["ORIG-one"]["metadata"]["favorite"] = None
+        outcome = run(library, [job], tmp_path)[job.key]
+        assert (outcome.status, outcome.detail) == ("refused", "unknown_favorite_or_archive")
 
-    def test_identical_replacement_id_never_reaches_restore_metadata(self, tmp_path):
-        settings = settings_for(tmp_path)
-        job = make_job(tmp_path, media_key="KEY1")
-        original = make_item("KEY1")
-        library = FakeLibrary(
-            by_hash={"out.avif": original},
-            items={"KEY1": original},
-        )
-        with pytest.raises(ReplaceError, match="not distinct"):
-            replace_one(library, job, settings=settings, ffprobe="ffprobe", apply=True, keep_originals=False)
-        assert "restore_metadata" not in library.names()
-        assert "trash" not in library.names()
+    def test_a_shared_album_original_is_refused(self, tmp_path):
+        job = make_job(tmp_path)
+        library = library_for("one")
+        library.items["ORIG-one"]["metadata"]["albums"] = [{"id": "s", "title": "Family", "shared": True}]
+        outcome = run(library, [job], tmp_path, skip_shared=True)[job.key]
+        assert (outcome.status, outcome.detail) == ("refused", "shared_album")
 
-    def test_dry_run_calls_nothing_mutating(self, tmp_path):
-        """apply=False must not restore metadata, verify, or trash anything."""
 
-        settings = settings_for(tmp_path)
-        job = make_job(tmp_path, media_key="KEY1")
-        original = make_item("KEY1")
-        replacement = make_item("REPL1")
-        library = FakeLibrary(
-            by_hash={"out.avif": replacement},
-            items={"KEY1": original},
-        )
-        outcome = replace_one(library, job, settings=settings, ffprobe="ffprobe", apply=False, keep_originals=False)
-        assert outcome.status == "would_replace"
-        assert not (set(library.names()) & MUTATING_CALLS)
-        # Reads still happen -- the original by key, and the replacement by
-        # its own hash, are both needed to report accurately.
-        assert library.names() == ["get_item", "find_uploaded"]
+class TestReplacement:
+    def test_an_encoded_file_changed_since_upload_fails_before_any_request(self, tmp_path):
+        job = make_job(tmp_path)
+        job.output.write_bytes(b"changed")
+        library = library_for("one")
+        outcome = run(library, [job], tmp_path)[job.key]
+        assert outcome.status == "failed"
+        assert "no longer matches" in outcome.detail
+        assert library.calls[0] == ("get_items", [])
 
-    def test_verify_failure_prevents_trash(self, tmp_path, monkeypatch):
-        """trash must never run once verification has raised."""
+    def test_not_found_by_hash_fails(self, tmp_path):
+        job = make_job(tmp_path)
+        library = library_for("one")
+        del library.by_output["one.avif"]
+        outcome = run(library, [job], tmp_path)[job.key]
+        assert outcome.status == "failed"
+        assert "not found by content hash" in outcome.detail
+        assert library.trashed() == []
 
-        patch_probe(monkeypatch)
-        settings = settings_for(tmp_path)
-        job = make_job(tmp_path, media_key="KEY1")
-        original = make_item("KEY1")
-        replacement = make_item("REPL1")
-        library = FakeLibrary(
-            by_hash={"out.avif": replacement},
-            items={"KEY1": original},
-            verify_error=ReplaceError("replacement verification failed"),
-        )
-        with pytest.raises(ReplaceError, match="verification failed"):
-            replace_one(library, job, settings=settings, ffprobe="ffprobe", apply=True, keep_originals=False)
-        assert library.names() == [
-            "get_item",
-            "find_uploaded",
-            "trust_replacement",
-            "restore_metadata",
-            "verify_replacement",
-        ]
-        assert "trash" not in library.names()
-        assert "is_trashed" not in library.names()
+    def test_a_lookup_error_fails(self, tmp_path):
+        job = make_job(tmp_path)
+        library = library_for("one")
+        library.by_output["one.avif"] = RemoteProtocolError("multiple exact hash matches")
+        assert run(library, [job], tmp_path)[job.key].status == "failed"
 
-    def test_unconfirmed_trash_raises_and_is_still_the_last_call(self, tmp_path, monkeypatch):
-        patch_probe(monkeypatch)
-        settings = settings_for(tmp_path)
-        job = make_job(tmp_path, media_key="KEY1")
-        original = make_item("KEY1")
-        replacement = make_item("REPL1")
-        library = FakeLibrary(
-            by_hash={"out.avif": replacement},
-            items={"KEY1": original},
-            trash_confirms=False,
-        )
-        with pytest.raises(ReplaceError, match="not confirmed"):
-            replace_one(library, job, settings=settings, ffprobe="ffprobe", apply=True, keep_originals=False)
-        assert library.names()[-2:] == ["trash", "is_trashed"]
+    def test_the_original_itself_is_not_a_replacement(self, tmp_path):
+        job = make_job(tmp_path)
+        library = library_for("one")
+        library.by_output["one.avif"] = "ORIG-one"
+        outcome = run(library, [job], tmp_path)[job.key]
+        assert outcome.status == "failed"
+        assert "not distinct" in outcome.detail
+        assert library.trashed() == []
 
-    def test_full_success_runs_every_step_in_order(self, tmp_path, monkeypatch):
-        patch_probe(monkeypatch)
-        settings = settings_for(tmp_path)
-        job = make_job(tmp_path, media_key="KEY1")
-        original = make_item("KEY1")
-        replacement = make_item("REPL1")
-        library = FakeLibrary(
-            by_hash={"out.avif": replacement},
-            items={"KEY1": original},
-        )
-        outcome = replace_one(library, job, settings=settings, ffprobe="ffprobe", apply=True, keep_originals=False)
+    def test_the_uploaders_batch_album_is_fine(self, tmp_path):
+        job = make_job(tmp_path)
+        library = library_for("one")
+        library.items["REPL-one"]["metadata"]["albums"] = [{"id": "b", "title": "photos-shrink batch 1", "shared": False}]
+        assert run(library, [job], tmp_path)[job.key].status == "replaced"
+        assert "restore_many" not in library.names()
+
+    def test_an_extra_shared_album_fails(self, tmp_path):
+        job = make_job(tmp_path)
+        library = library_for("one")
+        library.items["REPL-one"]["metadata"]["albums"] = [{"id": "s", "title": "Family", "shared": True}]
+        assert run(library, [job], tmp_path)[job.key].status == "failed"
+        assert library.trashed() == []
+
+
+class TestFixes:
+    def test_a_wrong_date_is_fixed_then_reread_then_trashed(self, tmp_path):
+        job = make_job(tmp_path)
+        library = library_for("one")
+        library.items["REPL-one"]["timestamp_ms"] = 1
+        outcome = run(library, [job], tmp_path)[job.key]
         assert outcome.status == "replaced"
-        assert outcome.original_media_key == "KEY1"
         assert library.names() == [
-            "get_item",
-            "find_uploaded",
-            "trust_replacement",
-            "restore_metadata",
-            "verify_replacement",
-            "trash",
-            "is_trashed",
+            "get_items", "find_uploaded_many", "get_items",
+            "restore_many", "get_items", "trash_many", "get_items",
         ]
+        assert library.calls[3] == ("restore_many", [("REPL-one", ["timestamp"])])
+        assert library.calls[4] == ("get_items", ["REPL-one"])
 
-    def test_keep_originals_restores_and_verifies_but_never_trashes(self, tmp_path, monkeypatch):
-        patch_probe(monkeypatch)
-        settings = settings_for(tmp_path)
-        job = make_job(tmp_path, media_key="KEY1")
-        original = make_item("KEY1")
-        replacement = make_item("REPL1")
-        library = FakeLibrary(
-            by_hash={"out.avif": replacement},
-            items={"KEY1": original},
-        )
-        outcome = replace_one(library, job, settings=settings, ffprobe="ffprobe", apply=True, keep_originals=True)
-        assert outcome.status == "verified_original_kept"
-        assert "restore_metadata" in library.names()
-        assert "verify_replacement" in library.names()
-        assert "trash" not in library.names()
-        assert "is_trashed" not in library.names()
+    def test_a_missing_album_is_added(self, tmp_path):
+        job = make_job(tmp_path)
+        library = library_for("one")
+        trip = {"id": "a", "title": "Trip", "shared": False}
+        library.items["ORIG-one"]["metadata"]["albums"] = [trip]
+        assert run(library, [job], tmp_path)[job.key].status == "replaced"
+        assert library.calls[3] == ("restore_many", [("REPL-one", ["albums"])])
+        assert trip in library.items["REPL-one"]["metadata"]["albums"]
+
+    def test_a_fix_that_does_not_take_is_never_trashed(self, tmp_path):
+        """The re-read decides, not the fix call's response."""
+
+        job = make_job(tmp_path)
+        library = library_for("one", fix_takes=False)
+        library.items["REPL-one"]["timestamp_ms"] = 1
+        outcome = run(library, [job], tmp_path)[job.key]
+        assert outcome.status == "failed"
+        assert "still differs after fixing: capture time" in outcome.detail
+        assert "trash_many" not in library.names()
+
+    def test_a_failed_fix_call_is_never_trashed(self, tmp_path):
+        """The live failure: rpc=DaSgWe on setting the capture time."""
+
+        job = make_job(tmp_path)
+        library = library_for("one", fix_errors={"REPL-one": RemoteProtocolError("rpc=DaSgWe")})
+        library.items["REPL-one"]["timestamp_ms"] = 1
+        outcome = run(library, [job], tmp_path)[job.key]
+        assert outcome.status == "failed"
+        assert "rpc=DaSgWe" in outcome.detail
+        assert "trash_many" not in library.names()
+
+    def test_only_items_that_need_it_are_fixed_or_reread(self, tmp_path):
+        clean = make_job(tmp_path, "clean", media_key="ORIG-clean")
+        dated = make_job(tmp_path, "dated", media_key="ORIG-dated")
+        library = library_for("clean", "dated")
+        library.items["REPL-dated"]["timestamp_ms"] = 1
+        outcomes = run(library, [clean, dated], tmp_path)
+        assert {outcomes[clean.key].status, outcomes[dated.key].status} == {"replaced"}
+        assert library.calls[3] == ("restore_many", [("REPL-dated", ["timestamp"])])
+        assert library.calls[4] == ("get_items", ["REPL-dated"])
 
 
-class TestReplacementTrust:
-    """The replacement is trusted on its receipt, and only on its receipt.
+class TestTrash:
+    def test_an_unconfirmed_trash_fails(self, tmp_path):
+        job = make_job(tmp_path)
+        library = library_for("one", trash_takes=False)
+        outcome = run(library, [job], tmp_path)[job.key]
+        assert (outcome.status, outcome.detail) == ("failed", "trash was not confirmed by the server")
 
-    The live cookie session cannot read ownership for an item uploaded through
-    the official API, and refuses it as "ownership is unknown". Its first live
-    run failed every replacement that way. Trust is what resolves that -- so it
-    has to be granted exactly when the receipt is complete, never earlier.
-    """
+    def test_a_trash_error_fails_the_whole_call_without_confirming(self, tmp_path):
+        jobs = [make_job(tmp_path, n, media_key=f"ORIG-{n}") for n in ("a", "b")]
+        library = library_for("a", "b", trash_error=RemoteProtocolError("rpc=XwAOJf"))
+        outcomes = run(library, jobs, tmp_path)
+        assert {o.status for o in outcomes.values()} == {"failed"}
+        assert library.names()[-1] == "trash_many"
 
-    def _library(self, original, replacement, **kw):
-        return FakeLibrary(
-            by_hash={"out.avif": replacement},
-            items={original["id"]: original},
-            **kw,
-        )
 
-    def test_an_api_upload_replaces_once_it_is_trusted(self, tmp_path, monkeypatch):
-        """The live failure, reproduced: without trust this raised."""
+class TestNeededFixes:
+    def test_nothing_when_everything_agrees(self):
+        assert needed_fixes(make_item("O"), make_item("R")) == {}
 
-        patch_probe(monkeypatch)
-        library = self._library(make_item("KEY1"), make_item("REPL1"), require_trust=True)
-        outcome = replace_one(library, make_job(tmp_path, media_key="KEY1"),
-                              settings=settings_for(tmp_path), ffprobe="ffprobe",
-                              apply=True, keep_originals=False)
-        assert outcome.status == "replaced"
-        assert library.trusted == {"REPL1"}
+    def test_timezone_alone_is_a_difference(self):
+        assert "timestamp" in needed_fixes(make_item("O"), make_item("R", timezone_offset=0))
 
-    def test_trust_comes_after_the_receipt_and_before_any_mutation(self, tmp_path, monkeypatch):
-        patch_probe(monkeypatch)
-        library = self._library(make_item("KEY1"), make_item("REPL1"))
-        replace_one(library, make_job(tmp_path, media_key="KEY1"),
-                    settings=settings_for(tmp_path), ffprobe="ffprobe",
-                    apply=True, keep_originals=False)
-        names = library.names()
-        assert names.index("trust_replacement") > names.index("find_uploaded")
-        assert names.index("trust_replacement") < names.index("restore_metadata")
+    def test_favorite_archive_and_description_are_carried(self):
+        original = make_item("O", metadata={"favorite": True, "archived": True, "description": "beach"})
+        assert needed_fixes(original, make_item("R")) == {"favorite": True, "archived": True, "description": "beach"}
 
-    def test_only_the_replacement_is_trusted_never_the_original(self, tmp_path, monkeypatch):
-        patch_probe(monkeypatch)
-        library = self._library(make_item("KEY1"), make_item("REPL1"))
-        replace_one(library, make_job(tmp_path, media_key="KEY1"),
-                    settings=settings_for(tmp_path), ffprobe="ffprobe",
-                    apply=True, keep_originals=False)
-        assert "KEY1" not in library.trusted
-
-    def test_nothing_is_trusted_in_a_dry_run(self, tmp_path, monkeypatch):
-        patch_probe(monkeypatch)
-        library = self._library(make_item("KEY1"), make_item("REPL1"))
-        replace_one(library, make_job(tmp_path, media_key="KEY1"),
-                    settings=settings_for(tmp_path), ffprobe="ffprobe",
-                    apply=False, keep_originals=False)
-        assert "trust_replacement" not in library.names()
-
-    def test_nothing_is_trusted_when_the_encoded_file_no_longer_matches_the_upload(self, tmp_path, monkeypatch):
-        """No complete receipt, no trust -- and nothing restored either."""
-
-        patch_probe(monkeypatch)
-        library = self._library(make_item("KEY1"), make_item("REPL1"))
-        job = make_job(tmp_path, media_key="KEY1", output_sha256="0" * 64)
-        with pytest.raises(ReplaceError, match="no longer matches"):
-            replace_one(library, job, settings=settings_for(tmp_path), ffprobe="ffprobe",
-                        apply=True, keep_originals=False)
-        assert "trust_replacement" not in library.names()
-        assert "restore_metadata" not in library.names()
-
-    def test_nothing_is_trusted_when_the_gate_refuses(self, tmp_path, monkeypatch):
-        patch_probe(monkeypatch)
-        library = self._library(make_item("KEY1", space_taken_bytes=0), make_item("REPL1"))
-        outcome = replace_one(library, make_job(tmp_path, media_key="KEY1"),
-                              settings=settings_for(tmp_path), ffprobe="ffprobe",
-                              apply=True, keep_originals=False)
-        assert outcome.status == "refused"
-        assert "trust_replacement" not in library.names()
+    def test_a_description_only_the_replacement_has_is_not_a_loss(self):
+        assert needed_fixes(make_item("O"), make_item("R", metadata={"description": "x"})) == {}

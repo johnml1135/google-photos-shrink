@@ -25,9 +25,10 @@ pinned to a reviewed revision. That session expires in about fifteen minutes,
 which is why everything that can be done without it is done first.
 
 **Nothing is deleted until its replacement has been proven.** An original is
-trashed only after its own bytes resolve in the library to the media key its
-sidecar claimed, the replacement resolves by its own content hash to a distinct
-item, and metadata restoration has been verified. Dry run is the default. Every
+trashed only after the item its sidecar's media key names has exactly the
+exported file's size, the replacement resolves by its own content hash to a
+distinct item, and the replacement has been re-read with the original's capture
+time and albums. Dry run is the default. Every
 original also stays in the Takeout export on disk, so even a mistake is
 recoverable by re-upload.
 
@@ -75,8 +76,9 @@ default, at replace time, when the live library can actually answer.
 ## What replacement preserves
 
 Replacement creates a **new Google Photos item**. Capture timestamps,
-descriptions, favorites, archive state, album membership, and (for photos) GPS
-coordinates are restored and verified before any original is trashed. Item links,
+descriptions, favorites, archive state and album membership are restored and
+verified before any original is trashed. Location is whatever the encoded file
+carries; it is not checked. Item links,
 comments, likes, edit history, face labels, album cover choices, and custom album
 ordering do not transfer.
 
@@ -257,19 +259,23 @@ uv run python tools/takeout_replace.py --journal G:/takeout-work/takeout-upload-
 uv run python tools/takeout_replace.py --journal G:/takeout-work/takeout-upload-journal.json --apply
 ```
 
-Restores the original's capture time, description, favourite and archive state,
-location and album membership onto the replacement, verifies it, and only then
+Restores the original's capture time, description, favourite and archive state
+and album membership onto the replacement, re-reads it to confirm, and only then
 moves the original to Google Photos trash. It is the closest thing to
 replacement that exists — no API or web client can swap an item's bytes in
 place.
 
 This step needs the browser session, because the API can neither write album
-membership nor delete. It is nonetheless short: the mirror already supplies each
-media key, so no library scan is needed — just a few small requests per photo
-with no file transfer. That is what keeps the phase inside one session.
+membership nor delete, and that session lasts about fifteen minutes. So it works
+in batches (`--batch`, default 100): each read, fix and trash carries the whole
+batch in a handful of requests, rather than a round trip per photo. The mirror
+already supplies each media key, so no library scan is needed, and nothing is
+downloaded. A photo that fails a check is left alone and the rest of its batch
+carries on.
 
 **Dry run is the default.** `--apply` is required before anything changes, and
-`--keep-originals` restores and verifies without ever trashing. Nothing is
+`--keep-originals` restores and verifies without ever trashing, and leaves the
+journal unchanged. Nothing is
 trashed whose replacement was not found by content hash and matched against the
 original's identity. Every original also remains in the Takeout export on disk,
 so a mistake is recoverable by re-uploading.
@@ -299,7 +305,7 @@ uv run python tools/takeout_replace.py --journal G:/takeout-work/takeout-upload-
 Steps 2 and 3 are resumable and safe to re-run; both track work by the library's
 own media key, so an interrupted run never uploads a photo twice. Step 5 is the
 only one that removes anything, and only after each replacement has been
-verified individually.
+verified.
 
 Work in batches rather than all at once. Uploading an entire library before
 deleting anything temporarily *increases* storage, since both copies exist until

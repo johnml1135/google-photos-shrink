@@ -1,24 +1,26 @@
-"""Finish a Takeout-sourced replacement: restore metadata, then trash the original.
+"""Finish Takeout-sourced replacements in batches: fix each replacement, then trash originals.
 
 The API can upload but cannot write album membership or delete, so this last
-step runs on the browser session. It is short: the Takeout sidecar already gave
-us each item's media key, so there is no library scan.
+step runs on the browser session, which lasts about fifteen minutes. So it
+works a batch at a time: every read, fix and trash below is one batched request
+for the whole batch, not a round trip per item.
 
-This is the only code here that destroys anything, so every deletion has to
-earn it. `replace_one` is the whole safety property: nine steps, in order, each
-a refusal point. An original is trashed only when all nine hold:
+This is the only code here that destroys anything. An original is trashed only
+when all of these hold, and any item that fails one is left alone while the
+rest of its batch carries on:
 
-  1. the job names a media key
-  2. `confirm_original` -- fetch the item by that key, and require it to have
-     the same id and exactly the exported original's size in bytes
-  3. the configured gate (`policy.verdict`) allows it -- shared albums, date
-     and name exclusions, and items that consume no quota are all refused
-  4. the replacement exists and resolves by its own content hash
-  5. `check_identity` -- the replacement is a distinct item from the original
-  6. `output_info_for` -- hash and path the verification requires
-  7. `restore_metadata`
-  8. `verify_replacement`
-  9. `trash`, confirmed by `is_trashed`
+  1. the job names a media key, and the exported original is on disk
+  2. the encoded file on disk is the one whose hash was recorded at upload
+  3. the item the sidecar's media key names has that id and exactly the
+     exported original's size in bytes -- a sidecar paired with the wrong
+     file names an item of another size
+  4. the configured gate (`policy.verdict`) allows it, and the original is not
+     shared, a partial upload, or a motion photo
+  5. the replacement resolves by its content hash to a distinct item
+  6. the replacement has the original's capture time, is in every album the
+     original is in, and carries its favorite, archive and description --
+     fixed where it does not, then re-read to prove the fix took
+  7. `trash_many`, confirmed by re-reading the original
 
 Dry run is the default. Every original also remains in the Takeout export on
 disk, so even a mistake is recoverable by re-upload.
@@ -26,11 +28,10 @@ disk, so even a mistake is recoverable by re-upload.
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass
-from pathlib import Path
 from typing import Any
 
-from . import media
 from .config import Settings
 from .integrity import sha256_file
 from .ledger import UploadRecord
@@ -41,142 +42,259 @@ class ReplaceError(RuntimeError):
     """Raised when a replacement cannot be completed safely."""
 
 
-def check_identity(original: dict[str, Any], replacement: dict[str, Any]) -> None:
-    """Refuse to mutate or trash anything that is not a distinct new item.
-
-    """
-
-    if not replacement or str(replacement.get("id")) == str(original.get("id")):
-        raise ReplaceError("replacement identity is not distinct from original")
-    if original.get("dedup_key") and replacement.get("dedup_key") == original.get("dedup_key"):
-        raise ReplaceError("replacement carries the original deduplication identity")
-
-
-def confirm_original(library: Any, source: Path, media_key: str) -> dict[str, Any]:
-    """Fetch the library item the sidecar names, and check it is this export.
-
-    The media key is read from the sidecar, and sidecars are paired to media by
-    filename -- which `takeout` has to de-truncate, so a pairing can be wrong.
-    The key is accepted when the item it names agrees with the exported file:
-    the same id, and exactly the same size in bytes.
-
-    Google's search by content hash is deliberately not used. On the live
-    library it missed items whose bytes it held, and for an exact duplicate it
-    returned the other copy -- refusing correct pairings while costing a lookup
-    for every item.
-    """
-
-    if not source.is_file():
-        raise ReplaceError(f"source original is missing from the export: {source}")
-    item = library.get_item(media_key)
-    if str(item.get("id")) != str(media_key):
-        raise ReplaceError(f"get_item returned {item.get('id')} for the sidecar's {media_key}")
-    exported = source.stat().st_size
-    if item.get("size_bytes") != exported:
-        raise ReplaceError(
-            f"library item is {item.get('size_bytes')} bytes but the exported original is "
-            f"{exported}; the sidecar may describe a different file"
-        )
-    return item
-
-
-def output_info_for(record: UploadRecord, output: Path, ffprobe: str) -> dict[str, Any]:
-    """Build what verify_replacement requires: the encoded hash and its path.
-
-    probe() reports dimensions and codec but neither the hash nor the path, and
-    verify_replacement refuses without both -- so building this from probe alone
-    made every replacement fail.
-    """
-
-    info = dict(media.probe(output, ffprobe))
-    recorded = record.output_sha256
-    actual = sha256_file(output)
-    if recorded and recorded != actual:
-        raise ReplaceError("the encoded file on disk no longer matches what was uploaded")
-    info["sha256"] = actual
-    info["path"] = str(output)
-    info["size_bytes"] = output.stat().st_size
-    return info
+# `GooglePhotosRemote` flags an item it cannot safely handle. For an original
+# about to be trashed, these flags refuse it. The others -- ownership the web
+# client cannot read, an unknown media type, no download URL -- say nothing
+# about whether deleting it loses anything: the original is in this account's
+# own Takeout export and costs its quota, which the gate requires.
+REFUSED_ORIGINAL_STATES = {
+    "shared item": "shared_item",
+    "shared album association": "shared_album",
+    "partial upload": "partial_upload",
+    "motion photo association is unsupported": "motion_photo",
+    "favorite/archive metadata unknown": "unknown_favorite_or_archive",
+}
 
 
 @dataclass(frozen=True)
 class Outcome:
     """What happened, or would happen, to one job."""
 
-    status: str  # "replaced" | "verified_original_kept" | "refused" | "would_replace"
+    status: str  # "replaced" | "would_replace" | "verified_original_kept" | "refused" | "failed"
     detail: str
     original_media_key: str | None = None
 
 
-def replace_one(
-    library: Any,
-    job: UploadRecord,
-    *,
-    settings: Settings,
-    ffprobe: str,
-    apply: bool,
-    keep_originals: bool,
-) -> Outcome:
-    """Restore metadata onto the replacement and trash the original.
+def check_original(item: dict[str, Any], job: UploadRecord) -> None:
+    """Accept the sidecar's media key only when the item it names matches the export.
 
-    `library` is any adapter offering find_uploaded, get_item,
-    restore_metadata, verify_replacement, trash and is_trashed -- the cookie
-    session in production, a fake in tests.
-
-    Raises `ReplaceError` for anything that cannot be completed safely.
-    A policy refusal is not an error: it is reported as `Outcome(status="refused", ...)`
-    so the caller can tell "this item must never be touched" apart from "something
-    went wrong that needs investigation".
+    Google's search by content hash is deliberately not used for originals. On
+    the live library it missed items whose bytes it held, and for an exact
+    duplicate it returned the other copy.
     """
 
-    media_key = job.media_key
-    if not media_key:
-        raise ReplaceError("no media key; the original cannot be identified")
-    if job.source is None:
-        raise ReplaceError("no source original recorded for this upload")
+    if str(item.get("id")) != str(job.media_key):
+        raise ReplaceError(f"library returned {item.get('id')} for the sidecar's {job.media_key}")
+    exported = job.source.stat().st_size
+    if item.get("size_bytes") != exported:
+        raise ReplaceError(
+            f"library item is {item.get('size_bytes')} bytes but the exported original is "
+            f"{exported}; the sidecar may describe a different file"
+        )
 
-    # Identity before anything else touches this item.
-    original = confirm_original(library, job.source, media_key)
+
+def refusal(settings: Settings, original: dict[str, Any]) -> str | None:
+    """Why this original must not be replaced, or None when it may be."""
 
     blocked = verdict(settings, Candidate.from_library_item(original))
     if blocked:
-        return Outcome(status="refused", detail=blocked, original_media_key=media_key)
+        return blocked
+    metadata = original.get("metadata") or {}
+    # Checked here as well as through the flags: the adapter reports only its
+    # first concern, so an unreadable owner can hide an unknown favorite.
+    if metadata.get("favorite") is None or metadata.get("archived") is None:
+        return "unknown_favorite_or_archive"
+    return REFUSED_ORIGINAL_STATES.get(original.get("skip_reason") or "")
 
-    if job.output is None:
-        raise ReplaceError("no encoded output recorded for this upload")
-    replacement = library.find_uploaded(job.output)
-    if replacement is None:
-        raise ReplaceError("replacement not found by content hash; not guessing")
-    check_identity(original, replacement)
+
+def check_identity(original: dict[str, Any], replacement: dict[str, Any]) -> None:
+    """Refuse a replacement that is not a distinct new item."""
+
+    if str(replacement.get("id")) == str(original.get("id")):
+        raise ReplaceError("replacement identity is not distinct from original")
+    if original.get("dedup_key") and replacement.get("dedup_key") == original.get("dedup_key"):
+        raise ReplaceError("replacement carries the original deduplication identity")
+
+
+def _albums(item: dict[str, Any]) -> dict[str, dict[str, Any]]:
+    albums = (item.get("metadata") or {}).get("albums") or []
+    return {album["id"]: album for album in albums if isinstance(album, dict) and album.get("id")}
+
+
+def needed_fixes(original: dict[str, Any], replacement: dict[str, Any]) -> dict[str, Any]:
+    """What must change on the replacement to carry the original's metadata. Empty when nothing."""
+
+    fixes: dict[str, Any] = {}
+    when = (original.get("timestamp_ms"), original.get("timezone_offset"))
+    if (replacement.get("timestamp_ms"), replacement.get("timezone_offset")) != when:
+        fixes["timestamp"] = when
+    have = _albums(replacement)
+    missing = [album for key, album in _albums(original).items() if key not in have]
+    if missing:
+        fixes["albums"] = missing
+    wanted, current = original.get("metadata") or {}, replacement.get("metadata") or {}
+    for key in ("favorite", "archived"):
+        if wanted.get(key) != current.get(key):
+            fixes[key] = bool(wanted.get(key))
+    # An original with no description has nothing to carry; one the upload
+    # happened to add is not a loss.
+    if wanted.get("description") and wanted.get("description") != current.get("description"):
+        fixes["description"] = wanted["description"]
+    return fixes
+
+
+def unexpected_shared_album(original: dict[str, Any], replacement: dict[str, Any]) -> bool:
+    """True when the replacement sits in a shared album the original is not in.
+
+    An extra album is expected -- the uploader files replacements into its own
+    batch album -- but a shared one would expose the photo further.
+    """
+
+    originals = _albums(original)
+    return any(album.get("shared") for key, album in _albums(replacement).items() if key not in originals)
+
+
+def describe(fixes: dict[str, Any]) -> str:
+    parts = []
+    if "timestamp" in fixes:
+        parts.append("capture time")
+    if fixes.get("albums"):
+        parts.append(f"{len(fixes['albums'])} album(s)")
+    parts += [key for key in ("favorite", "archived", "description") if key in fixes]
+    return ", ".join(parts)
+
+
+def replace_batch(
+    library: Any,
+    jobs: list[UploadRecord],
+    *,
+    settings: Settings,
+    apply: bool,
+    keep_originals: bool,
+    progress: Callable[[str], None] = lambda message: None,
+) -> dict[str, Outcome]:
+    """Replace a batch of jobs; return each job's outcome, keyed by `UploadRecord.key`.
+
+    `library` is any adapter offering get_items, find_uploaded_many,
+    restore_many and trash_many -- the cookie session in production, a fake in
+    tests. A failure is recorded against its own job and never stops the rest.
+    """
+
+    outcomes: dict[str, Outcome] = {}
+    live: dict[str, UploadRecord] = {}
+
+    def fail(job: UploadRecord, detail: str) -> None:
+        outcomes[job.key] = Outcome("failed", detail, job.media_key)
+        live.pop(job.key, None)
+
+    # 1-2: everything that can be settled on disk, before any request.
+    for job in jobs:
+        if not job.media_key:
+            outcomes[job.key] = Outcome("failed", "no media key; the original cannot be identified")
+        elif job.source is None or not job.source.is_file():
+            outcomes[job.key] = Outcome("failed", f"source original is missing from the export: {job.source}", job.media_key)
+        elif job.output is None or not job.output.is_file():
+            outcomes[job.key] = Outcome("failed", "the encoded output is missing", job.media_key)
+        elif job.output_sha256 and sha256_file(job.output) != job.output_sha256:
+            outcomes[job.key] = Outcome("failed", "the encoded file on disk no longer matches what was uploaded", job.media_key)
+        else:
+            live[job.key] = job
+
+    # 3-4: the originals, by the sidecar's media key.
+    progress(f"reading {len(live)} original(s)")
+    originals_by_key = library.get_items([job.media_key for job in live.values()])
+    originals: dict[str, dict[str, Any]] = {}
+    for job in list(live.values()):
+        item = originals_by_key.get(job.media_key)
+        if item is None or isinstance(item, Exception):
+            fail(job, f"original could not be read: {item or 'no response'}")
+            continue
+        try:
+            check_original(item, job)
+        except ReplaceError as exc:
+            fail(job, str(exc))
+            continue
+        blocked = refusal(settings, item)
+        if blocked:
+            outcomes[job.key] = Outcome("refused", blocked, job.media_key)
+            live.pop(job.key)
+            continue
+        originals[job.key] = item
+
+    # 5: the replacements, by the content hash of what was uploaded.
+    progress(f"finding {len(live)} replacement(s)")
+    matches = library.find_uploaded_many([job.output for job in live.values()])
+    replacement_keys: dict[str, str] = {}
+    for job in list(live.values()):
+        match = matches.get(job.output)
+        if match is None:
+            fail(job, "replacement not found by content hash; not guessing")
+        elif isinstance(match, Exception):
+            fail(job, f"replacement lookup failed: {match}")
+        else:
+            replacement_keys[job.key] = match["id"]
+
+    def read_replacements(keys: list[str]) -> dict[str, dict[str, Any]]:
+        found = library.get_items([replacement_keys[key] for key in keys])
+        result = {}
+        for key in keys:
+            item = found.get(replacement_keys[key])
+            if item is None or isinstance(item, Exception):
+                fail(live[key], f"replacement could not be read: {item or 'no response'}")
+                continue
+            result[key] = item
+        return result
+
+    replacements = read_replacements(list(live))
+    fixes: dict[str, dict[str, Any]] = {}
+    for key, replacement in replacements.items():
+        job, original = live[key], originals[key]
+        try:
+            check_identity(original, replacement)
+        except ReplaceError as exc:
+            fail(job, str(exc))
+            continue
+        if unexpected_shared_album(original, replacement):
+            fail(job, "replacement is in a shared album the original is not in")
+            continue
+        needed = needed_fixes(original, replacement)
+        if needed:
+            fixes[key] = needed
 
     if not apply:
-        albums = len((original.get("metadata") or {}).get("albums") or [])
-        return Outcome(
-            status="would_replace",
-            detail=f"would restore {albums} album(s) and trash {media_key}",
-            original_media_key=media_key,
-        )
+        for key, job in live.items():
+            detail = f"would fix {describe(fixes[key])}, then trash" if key in fixes else "ready to trash"
+            outcomes[key] = Outcome("would_replace", detail, job.media_key)
+        return outcomes
 
-    info = output_info_for(job, job.output, ffprobe)
-    # The receipt is now complete: the file on disk is the one whose hash was
-    # recorded at upload, and the library holds an item with exactly those
-    # bytes. That is proof this replacement is ours, which the web client cannot
-    # read for an API upload -- so vouch for it before anything is restored or
-    # verified. Never earlier: without a full receipt nothing is trusted.
-    library.trust_replacement(str(replacement["id"]))
-    library.restore_metadata(original, replacement)
-    library.verify_replacement(original, replacement, info)
+    # 6: fix what differs, then re-read every fixed replacement -- the re-read,
+    # not the fix call's response, is what decides.
+    if fixes:
+        progress(f"fixing {len(fixes)} replacement(s)")
+        failures = library.restore_many(
+            [{"replacement": replacements[key], **needed} for key, needed in fixes.items() if key in live]
+        )
+        by_replacement = {replacement_keys[key]: key for key in fixes}
+        for replacement_id, error in failures.items():
+            key = by_replacement.get(replacement_id)
+            if key in live:
+                fail(live[key], f"fixing {describe(fixes[key])} failed: {error}")
+        for key, replacement in read_replacements([key for key in fixes if key in live]).items():
+            still = needed_fixes(originals[key], replacement)
+            if still:
+                fail(live[key], f"replacement still differs after fixing: {describe(still)}")
+            elif unexpected_shared_album(originals[key], replacement):
+                fail(live[key], "replacement is in a shared album the original is not in")
 
     if keep_originals:
-        return Outcome(
-            status="verified_original_kept",
-            detail="verified, original kept",
-            original_media_key=media_key,
-        )
+        for key, job in live.items():
+            outcomes[key] = Outcome("verified_original_kept", "verified, original kept", job.media_key)
+        return outcomes
 
-    library.trash(original)
-    if not library.is_trashed(original):
-        raise ReplaceError("trash was not confirmed by the server")
-    return Outcome(
-        status="replaced", detail="replaced, original trashed", original_media_key=media_key
-    )
+    # 7: trash every original still standing in one call, then confirm each.
+    if live:
+        progress(f"trashing {len(live)} original(s)")
+        try:
+            library.trash_many([originals[key]["dedup_key"] for key in live])
+        except Exception as exc:  # noqa: BLE001 - recorded against every job in the call
+            for job in list(live.values()):
+                fail(job, f"trash failed: {type(exc).__name__}: {exc}")
+    if live:
+        confirmed = library.get_items([job.media_key for job in live.values()])
+        for key, job in list(live.items()):
+            item = confirmed.get(job.media_key)
+            if isinstance(item, dict) and item.get("trashed"):
+                outcomes[key] = Outcome("replaced", "replaced, original trashed", job.media_key)
+            else:
+                fail(job, "trash was not confirmed by the server")
+    return outcomes

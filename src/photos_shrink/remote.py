@@ -55,6 +55,16 @@ def _asdict(value: Any) -> Any:
     return value
 
 
+def _content_hash(path: Path) -> str:
+    """The hash Google Photos matches uploads by: SHA-1, standard base64."""
+
+    digest = hashlib.sha1()
+    with path.open("rb") as stream:
+        for block in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(block)
+    return base64.b64encode(digest.digest()).decode("ascii")
+
+
 class GooglePhotosRemote:
     def __init__(
         self,
@@ -680,11 +690,7 @@ class GooglePhotosRemote:
         file_path = Path(path)
         if not file_path.is_file():
             raise RemoteProtocolError("upload source does not exist")
-        digest = hashlib.sha1()
-        with file_path.open("rb") as stream:
-            for block in iter(lambda: stream.read(1024 * 1024), b""):
-                digest.update(block)
-        content_hash = base64.b64encode(digest.digest()).decode("ascii")
+        content_hash = _content_hash(file_path)
         data = self._execute(self._payloads.GetRemoteMatchesByHash([content_hash]))
         if not isinstance(data, list):
             raise RemoteProtocolError("Google Photos hash response is malformed")
@@ -935,6 +941,182 @@ class GooglePhotosRemote:
     def is_trashed(self, item: dict[str, Any]) -> bool:
         fresh = self.get_item(str(item.get("id", "")))
         return bool(fresh.get("trashed"))
+
+    # --- Batched calls for the replace step ------------------------------------
+    #
+    # The web client's batchexecute endpoint carries many calls in one HTTP
+    # request. Replacing one item at a time cost about ten requests and a
+    # download per item; these carry a whole batch in a handful.
+
+    def _execute_many(self, payloads: list[Any]) -> list[Any]:
+        """Send several calls in one request; return each one's data or its error, in order.
+
+        A call Google answers unsuccessfully fails alone, as a
+        `RemoteProtocolError` in its slot. A request that fails outright raises.
+        """
+
+        if not payloads:
+            return []
+        if self._client is None:
+            self.login()
+        self._bound_session_timeout()
+        self._maybe_refresh()
+        try:
+            responses = self._send_many(payloads)
+        except RemoteProtocolError as original:
+            if not all(self._is_read_only(p) for p in payloads) or self._session_refresh_seconds <= 0:
+                raise
+            try:
+                self.refresh_session()
+            except SessionRefreshError as exc:
+                raise original from exc
+            responses = self._send_many(payloads)
+        by_id = {getattr(response, "response_id", None): response for response in responses}
+        results: list[Any] = []
+        for payload in payloads:
+            name = self._request_name(payload)
+            response = by_id.get(getattr(payload, "payload_id", None))
+            if response is None:
+                results.append(RemoteProtocolError(f"Google Photos sent no response rpc={name}"))
+            elif not getattr(response, "success", False):
+                results.append(RemoteProtocolError(f"Google Photos returned an unsuccessful response rpc={name}"))
+            elif getattr(response, "data", None) is None:
+                results.append(RemoteProtocolError(f"Google Photos returned an empty response rpc={name}"))
+            else:
+                results.append(response.data)
+        return results
+
+    def _send_many(self, payloads: list[Any]) -> list[Any]:
+        try:
+            responses = self._client.send_api_request(list(payloads))
+        except Exception as exc:
+            status = getattr(exc, "status_code", None)
+            if status is None:
+                status = getattr(getattr(exc, "response", None), "status_code", None)
+            suffix = f" status={status}" if status is not None else ""
+            names = ",".join(sorted({self._request_name(p) for p in payloads}))
+            raise RemoteProtocolError(f"Google Photos request failed rpc={names}{suffix}") from exc
+        if not isinstance(responses, list):
+            raise RemoteProtocolError("Google Photos batch response is malformed")
+        return responses
+
+    def get_items(self, media_keys: list[str], *, per_request: int = 25) -> dict[str, dict[str, Any] | Exception]:
+        """`get_item` for many keys: each key maps to its item, or to why it could not be read."""
+
+        self._load_dependencies()
+        results: dict[str, dict[str, Any] | Exception] = {}
+        keys = list(dict.fromkeys(media_keys))
+        for start in range(0, len(keys), per_request):
+            chunk = keys[start : start + per_request]
+            payloads: list[Any] = []
+            for key in chunk:
+                payloads += [self._payloads.GetItemInfo(key), self._payloads.GetItemInfoExt(key)]
+            answers = self._execute_many(payloads)
+            for index, key in enumerate(chunk):
+                info, ext = answers[2 * index], answers[2 * index + 1]
+                failure = next((a for a in (info, ext) if isinstance(a, Exception)), None)
+                if failure is not None:
+                    results[key] = failure
+                    continue
+                try:
+                    results[key] = self._convert_item(info, ext, self._library_context.get(key))
+                except RemoteProtocolError as exc:
+                    results[key] = exc
+        return results
+
+    def find_uploaded_many(
+        self, paths: list[Path], *, per_request: int = 50
+    ) -> dict[Path, dict[str, Any] | None | Exception]:
+        """Resolve many files by content hash: a match, None when absent, or the error.
+
+        Only the identity and capture time are returned; `get_items` supplies
+        the rest.
+        """
+
+        self._load_dependencies()
+        hashes = {Path(path): _content_hash(Path(path)) for path in paths}
+        results: dict[Path, dict[str, Any] | None | Exception] = {}
+        entries = list(hashes.items())
+        for start in range(0, len(entries), per_request):
+            chunk = entries[start : start + per_request]
+            (data,) = self._execute_many([self._payloads.GetRemoteMatchesByHash([h for _, h in chunk])])
+            if isinstance(data, Exception) or not isinstance(data, list):
+                error = data if isinstance(data, Exception) else RemoteProtocolError(
+                    "Google Photos hash response is malformed"
+                )
+                results.update({path: error for path, _ in chunk})
+                continue
+            for path, content_hash in chunk:
+                matches = [m for m in data if getattr(m, "hash", None) == content_hash]
+                if not matches:
+                    results[path] = None
+                elif len(matches) > 1:
+                    results[path] = RemoteProtocolError("Google Photos returned multiple exact hash matches")
+                else:
+                    media_key = getattr(matches[0], "media_key", None)
+                    dedup_key = getattr(matches[0], "dedup_key", None)
+                    if not isinstance(media_key, str) or not media_key or not isinstance(dedup_key, str) or not dedup_key:
+                        results[path] = RemoteProtocolError("Google Photos hash match has incomplete identity")
+                    else:
+                        results[path] = {"id": media_key, "dedup_key": dedup_key}
+        return results
+
+    def restore_many(self, fixes: list[dict[str, Any]], *, per_request: int = 50) -> dict[str, Exception]:
+        """Apply metadata fixes to replacements; return the failures by replacement id.
+
+        Each fix names a `replacement` item and only what must change:
+        `timestamp` as (epoch ms, offset ms), `albums` to add it to, and
+        `favorite`, `archived` or `description`. A successful call proves
+        nothing on its own -- the caller re-reads every fixed replacement.
+        """
+
+        self._load_dependencies()
+        calls: list[tuple[str, Any]] = []
+        failures: dict[str, Exception] = {}
+        for fix in fixes:
+            replacement = fix["replacement"]
+            item_id, dedup = replacement["id"], replacement["dedup_key"]
+            if "timestamp" in fix:
+                timestamp, offset = fix["timestamp"]
+                if offset % 1000:
+                    failures[item_id] = RemoteProtocolError("original timezone offset is not whole seconds")
+                    continue
+                calls.append((item_id, self._payloads.SetItemTimestamp(dedup, timestamp, offset // 1000)))
+            for album in fix.get("albums", []):
+                if album["shared"] and self.skip_shared:
+                    failures[item_id] = RemoteProtocolError("shared album association cannot be restored safely")
+                    continue
+                payload_type = (
+                    self._payloads.AddItemsToExistingSharedAlbum
+                    if album["shared"]
+                    else self._payloads.AddItemsToExistingAlbum
+                )
+                calls.append((item_id, payload_type([item_id], album["id"])))
+            if "favorite" in fix:
+                payload = self._payloads.SetFavorite if fix["favorite"] else self._payloads.UnFavorite
+                calls.append((item_id, payload([dedup])))
+            if "archived" in fix:
+                payload = self._payloads.SetArchive if fix["archived"] else self._payloads.UnArchive
+                calls.append((item_id, payload([dedup])))
+            if "description" in fix:
+                calls.append((item_id, self._payloads.SetItemDescription(dedup, fix["description"])))
+        for start in range(0, len(calls), per_request):
+            chunk = calls[start : start + per_request]
+            answers = self._execute_many([payload for _, payload in chunk])
+            for (item_id, _), answer in zip(chunk, answers, strict=True):
+                if isinstance(answer, Exception):
+                    failures.setdefault(item_id, answer)
+        return failures
+
+    def trash_many(self, dedup_keys: list[str], *, per_request: int = 100) -> None:
+        """Move items to the bin, up to `per_request` in one call. Confirm with `get_items`."""
+
+        self._load_dependencies()
+        keys = [key for key in dedup_keys if isinstance(key, str) and key]
+        if len(keys) != len(dedup_keys):
+            raise RemoteProtocolError("cannot trash items with incomplete identity")
+        for start in range(0, len(keys), per_request):
+            self._execute(self._payloads.MoveToTrash(keys[start : start + per_request]))
 
     def close(self) -> None:
         if self._browser is not None:
