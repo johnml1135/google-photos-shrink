@@ -6,6 +6,7 @@ import json
 import math
 import os
 import subprocess
+import time
 from pathlib import Path
 from typing import Any
 
@@ -402,6 +403,71 @@ def _encode_photo(source: Path, destination: Path, settings: dict[str, Any]) -> 
         raise MediaError(f"photo encoding failed for {source}: {exc}") from exc
 
 
+def run_ffmpeg(
+    command: list[str],
+    *,
+    timeout: float,
+    output: Path | None = None,
+    stall_seconds: float = 300,
+    poll_seconds: float = 5,
+) -> None:
+    """Run ffmpeg, and abandon it when it stops making progress.
+
+    One 11-minute MOV in this library wedges ffmpeg: no CPU, nothing written,
+    and it survives a kill. Without a bound that single file stalled a
+    196-video run indefinitely, which is what it did.
+
+    Progress is the output file growing, so a long encode is never cut off for
+    being long, while a wedged one is dropped in minutes rather than hours.
+    `timeout` remains an outer bound for a run that grows its file but never
+    finishes. A process that will not die is left to the operating system: the
+    run must lose the file, not the queue.
+    """
+
+    process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    started = last_progress = time.monotonic()
+    seen = -1
+
+    def abandon(why: str) -> MediaError:
+        process.kill()
+        try:
+            process.communicate(timeout=10)
+        except subprocess.TimeoutExpired:
+            pass
+        return MediaError(f"video encoding {why}: {command[-1]}")
+
+    while True:
+        try:
+            _, stderr = process.communicate(timeout=poll_seconds)
+        except subprocess.TimeoutExpired:
+            now = time.monotonic()
+            size = output.stat().st_size if output is not None and output.exists() else -1
+            if size != seen:
+                seen, last_progress = size, now
+            if now - last_progress >= stall_seconds:
+                raise abandon(f"wrote nothing for {stall_seconds:.0f}s") from None
+            if now - started >= timeout:
+                raise abandon(f"did not finish within {timeout:.0f}s") from None
+            continue
+        break
+    if process.returncode != 0:
+        raise MediaError(f"video encoding failed ({process.returncode}): {stderr.strip()[:400]}")
+
+
+def encode_timeout(duration_seconds: float | None, settings: dict[str, Any]) -> float:
+    """The outer bound for one video, scaled by the source's own length.
+
+    `videos.timeout_factor` and `videos.timeout_floor_seconds` tune it; the
+    stall watchdog in `run_ffmpeg` is what catches a wedged encode quickly.
+    """
+
+    options = settings.get("videos", {})
+    factor = float(options.get("timeout_factor", 12) or 12)
+    floor = float(options.get("timeout_floor_seconds", 900) or 900)
+    duration = float(duration_seconds or 0)
+    return max(floor, duration * factor)
+
+
 def _encode_video(
     source: Path,
     destination: Path,
@@ -470,10 +536,16 @@ def _encode_video(
         command += ["-t", f"{limit_seconds:g}"]
     command.append(os.fspath(destination))
     try:
-        subprocess.run(command, check=True, capture_output=True, text=True)
-    except (OSError, subprocess.CalledProcessError) as exc:
-        detail = getattr(exc, "stderr", "") or str(exc)
-        raise MediaError(f"video encoding failed for {source}: {detail}") from exc
+        run_ffmpeg(
+            command,
+            timeout=encode_timeout(info.get("duration_seconds"), settings),
+            output=destination,
+            stall_seconds=float(options.get("stall_seconds", 300) or 300),
+        )
+    except MediaError as exc:
+        raise MediaError(f"video encoding failed for {source}: {exc}") from exc
+    except OSError as exc:
+        raise MediaError(f"video encoding failed for {source}: {exc}") from exc
 
 
 def encode(

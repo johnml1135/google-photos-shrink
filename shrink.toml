@@ -66,7 +66,9 @@ work_dir = ".photos-shrink"
 data_dir = "G:/takeout-work"
 pause_seconds = 10
 minimum_savings_percent = 20
-threads = 2
+# ffmpeg threads per video. This machine has 20 logical processors; at 2 a
+# 1080p CRF 30 encode crawls, and videos run one at a time anyway.
+threads = 12
 skip_shared = false
 skip_non_space_consuming = true
 photos_only = false
