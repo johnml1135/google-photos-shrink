@@ -24,6 +24,12 @@ if not _FFMPEG_BIN:
         Path(__file__).parents[1]
         / ".cache"
         / "tools"
+        / "ff-full"
+        / "ffmpeg-master-latest-win64-gpl"
+        / "bin",
+        Path(__file__).parents[2]
+        / ".cache"
+        / "tools"
         / "ffmpeg"
         / "ffmpeg-9.0.1-essentials_build"
         / "bin",
@@ -49,9 +55,10 @@ PHOTO_SETTINGS = {
     "videos": {
         "long_edge": 1920,
         "short_edge": 1080,
-        "codec": "hevc",
-        "crf": 28,
-        "preset": "slow",
+        "codec": "av1",
+        "encoder": "libsvtav1",
+        "crf": 36,
+        "preset": "10",
         "max_fps": 0,
         "audio_bitrate_kbps": 96,
     },
@@ -282,7 +289,7 @@ def test_video_encode_preserves_audio_duration_and_dimensions(tmp_path: Path) ->
     )
     settings = {
         **PHOTO_SETTINGS,
-        "videos": {**PHOTO_SETTINGS["videos"], "preset": "ultrafast"},
+        "videos": {**PHOTO_SETTINGS["videos"], "preset": "12"},
     }
     result = encode(source, output, settings)
     assert result["kind"] == "video"
@@ -332,7 +339,7 @@ def test_video_probe_and_encode_are_rotation_aware_and_fps_is_a_cap(
     assert (source_info["width"], source_info["height"]) == (64, 96)
     settings = {
         **PHOTO_SETTINGS,
-        "videos": {**PHOTO_SETTINGS["videos"], "max_fps": 6, "preset": "ultrafast"},
+        "videos": {**PHOTO_SETTINGS["videos"], "max_fps": 6, "preset": "12"},
     }
     encode(source, output, settings)
     output_info = probe(output, PHOTO_SETTINGS["tools"]["ffprobe"])
@@ -610,3 +617,29 @@ class TestRunFfmpeg:
         assert media.encode_timeout(600, settings) == 6000
         assert media.encode_timeout(5, settings) == 900
         assert media.encode_timeout(None, settings) == 900
+
+
+class TestVideoEncoderArgs:
+    """Each encoder's arguments, chosen by measurement on this library."""
+
+    def test_av1_is_the_default(self):
+        args = media.video_encoder_args({})
+        assert args == ["-c:v", "libsvtav1", "-preset", "8", "-crf", "36"]
+
+    def test_av1_takes_the_configured_quality_and_preset(self):
+        args = media.video_encoder_args({"crf": 40, "preset": "6"})
+        assert args == ["-c:v", "libsvtav1", "-preset", "6", "-crf", "40"]
+
+    def test_nvenc_uses_a_quality_target_not_constant_qp(self):
+        args = media.video_encoder_args({"encoder": "hevc_nvenc", "crf": 32, "preset": "p7"})
+        assert args[:4] == ["-c:v", "hevc_nvenc", "-preset", "p7"]
+        assert "-cq" in args and args[args.index("-cq") + 1] == "32"
+        assert args[args.index("-rc") + 1] == "vbr"
+
+    def test_x265_remains_available(self):
+        args = media.video_encoder_args({"encoder": "libx265", "crf": 30, "preset": "slow"})
+        assert args == ["-c:v", "libx265", "-crf", "30", "-preset", "slow"]
+
+    def test_an_unknown_encoder_is_refused(self):
+        with pytest.raises(media.UnsupportedMediaError, match="unsupported video encoder"):
+            media.video_encoder_args({"encoder": "libmagic"})

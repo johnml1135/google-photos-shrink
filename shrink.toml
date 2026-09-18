@@ -12,38 +12,42 @@ quality = 60
 # is 28 (x264's is 23 -- they are not the same scale), and +6 CRF roughly
 # halves the size.
 #
-#   long_edge/short_edge   crf    videos    whole library
-#   1920/1080               28    1.84 GB      4.14 GB   x265 default
-#   1920/1080               30    1.32 GB      3.62 GB   <- chosen
-#   1920/1080               32    0.95 GB      3.25 GB
-#   1280/720                28    0.92 GB      3.22 GB
-#   1280/720                30    0.67 GB      2.97 GB
-#    720/480                28    0.39 GB      2.69 GB   DVD, standard definition
+# The encoder was chosen by measurement on this library, on one 52s 1080p phone
+# video whose source is 24.4 MB:
 #
-# 1080p/32 and 720p/28 cost the same bytes; they differ in how those bytes are
-# spent. For handheld phone footage the 720p side tends to look better, because
-# downscaling averages away the sensor noise that coarse quantisation turns
-# into blocking on a fast pan.
+#   encoder            setting      time    output   note
+#   libx265            preset slow  never   --       wedged ffmpeg on this machine
+#   hevc_nvenc (GPU)   cq 28         14s    22.8 MB  barely smaller than the source
+#   hevc_nvenc (GPU)   cq 36         14s     9.4 MB
+#   libsvtav1          crf 32        36s    13.4 MB
+#   libsvtav1          crf 36        36s    10.7 MB  <- chosen
+#   libsvtav1          crf 40        39s     8.3 MB
+#   libsvtav1          crf 44        39s     6.6 MB
 #
-# 30 is chosen as the free win: it keeps HD, sits inside the 25-30 "balanced"
-# band the x265 guides recommend for 1080p, and saves half a gigabyte. Dropping
-# to DVD would save 1.45 GB more but takes every video to standard definition
-# permanently -- it moves the whole library from 83.5% saved to 89.3%, which is
-# a poor trade for footage whose originals you intend to delete.
+# AV1 wins on bytes at every comparable quality, and SVT-AV1 preset 8 runs at
+# about 1.4x realtime here -- roughly 70x faster than libx265 managed on the
+# same machine, which never finished a file at all. AV1 is newer than HEVC, so
+# a very old device may not play it directly; Google Photos stores and
+# transcodes it fine.
+#
+# crf is AV1's 0-63 scale, not x265's: 36 here is not 36 there. AV1 crf 36 is
+# roughly HEVC cq 30-32 in quality.
 #
 # Changing crf or the edges makes existing video outputs stale. Re-encode just
 # those with:  tools/takeout_encode.py <root> --kinds video --no-resume
 long_edge = 1920
 short_edge = 1080
-codec = "hevc"
-crf = 30
-preset = "slow"
+codec = "av1"
+encoder = "libsvtav1"
+crf = 36
+preset = "8"
 max_fps = 0
 audio_bitrate_kbps = 96
 
 [tools]
-ffmpeg = ".cache/tools/ffmpeg/ffmpeg-9.0.1-essentials_build/bin/ffmpeg.exe"
-ffprobe = ".cache/tools/ffmpeg/ffmpeg-9.0.1-essentials_build/bin/ffprobe.exe"
+# The full build, for libsvtav1: gyan's "essentials" build does not carry it.
+ffmpeg = ".cache/tools/ff-full/ffmpeg-master-latest-win64-gpl/bin/ffmpeg.exe"
+ffprobe = ".cache/tools/ff-full/ffmpeg-master-latest-win64-gpl/bin/ffprobe.exe"
 
 [google]
 cookies_file = ".photos-shrink/cookies.txt"

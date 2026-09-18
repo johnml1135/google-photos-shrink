@@ -491,6 +491,35 @@ def encode_timeout(duration_seconds: float | None, settings: dict[str, Any]) -> 
     return max(floor, duration * factor)
 
 
+def video_encoder_args(options: dict[str, Any]) -> list[str]:
+    """The codec arguments for the configured video encoder.
+
+    Measured on this library's own clips, one 52s 1080p phone video, source
+    24.4 MB: SVT-AV1 preset 8 crf 36 gives 10.7 MB in 36s; HEVC through NVENC
+    needs cq 36 to reach 9.4 MB and looks worse doing it; libx265 preset slow
+    never finished a single file on the machine this ran on, wedging ffmpeg
+    entirely. So AV1 is the default, and the other two stay available.
+    """
+
+    encoder = str(options.get("encoder", "libsvtav1"))
+    crf = int(options.get("crf", 36))
+    preset = str(options.get("preset", "8"))
+    if encoder == "libsvtav1":
+        return ["-c:v", "libsvtav1", "-preset", preset, "-crf", str(crf)]
+    if encoder == "hevc_nvenc":
+        # NVENC's cq is not x265's crf: vbr with a quality target, plus the
+        # lookahead and B-frame references that narrow the size gap.
+        return [
+            "-c:v", "hevc_nvenc", "-preset", preset, "-tune", "hq",
+            "-rc", "vbr", "-b:v", "0", "-cq", str(crf),
+            "-multipass", "fullres", "-bf", "4", "-b_ref_mode", "each",
+            "-rc-lookahead", "32", "-temporal-aq", "1",
+        ]
+    if encoder == "libx265":
+        return ["-c:v", "libx265", "-crf", str(crf), "-preset", preset]
+    raise UnsupportedMediaError(f"unsupported video encoder: {encoder}")
+
+
 def _encode_video(
     source: Path,
     destination: Path,
@@ -503,7 +532,11 @@ def _encode_video(
         raise UnsupportedMediaError(info["skip_reason"])
     width, height = target_dimensions(info["width"], info["height"], "video", settings)
     options = settings.get("videos", {})
-    filters = [f"scale={width}:{height}:flags=lanczos"]
+    # Rescaling to the size it already is costs a Lanczos pass per frame and
+    # changes nothing.
+    filters = []
+    if (width, height) != (info["width"], info["height"]):
+        filters.append(f"scale={width}:{height}:flags=lanczos")
     max_fps = float(options.get("max_fps", 0) or 0)
     if max_fps > 0 and info.get("frame_rate") and info["frame_rate"] > max_fps:
         filters.insert(0, f"fps={max_fps:g}")
@@ -527,20 +560,17 @@ def _encode_video(
         "0:v:0",
         "-map_metadata",
         "0",
-        "-vf",
-        ",".join(filters),
-        "-c:v",
-        "libx265",
-        "-crf",
-        str(int(options.get("crf", 28))),
-        "-preset",
-        str(options.get("preset", "slow")),
+    ]
+    if filters:
+        command += ["-vf", ",".join(filters)]
+    command += video_encoder_args(options)
+    command += [
         "-pix_fmt",
         "yuv420p",
         "-fps_mode",
         "passthrough",
     ]
-    if threads > 0:
+    if threads > 0 and options.get("encoder", "libsvtav1") == "libx265":
         command += [
             "-threads",
             str(threads),

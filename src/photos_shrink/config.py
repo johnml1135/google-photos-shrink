@@ -19,10 +19,21 @@ class ConfigError(ValueError):
     """Raised when shrink.toml is invalid."""
 
 
+# encoder -> (highest crf/cq it accepts, the presets it understands). AV1's
+# scale runs to 63 and its presets are numbers; x265 keeps ffmpeg's words;
+# NVENC uses p1-p7. A value from one scale means something else on another.
+VIDEO_ENCODERS = {
+    "libsvtav1": (63, {str(n) for n in range(14)}),
+    "libx265": (51, {"ultrafast", "superfast", "veryfast", "faster", "fast",
+                     "medium", "slow", "slower", "veryslow", "placebo"}),
+    "hevc_nvenc": (51, {f"p{n}" for n in range(1, 8)}),
+}
+
 DEFAULTS: dict[str, dict[str, Any]] = {
     "photos": {"short_edge": 1500, "format": "avif", "quality": 60},
-    "videos": {"long_edge": 1920, "short_edge": 1080, "codec": "hevc", "crf": 28,
-               "preset": "slow", "max_fps": 0, "audio_bitrate_kbps": 96},
+    "videos": {"long_edge": 1920, "short_edge": 1080, "codec": "av1", "encoder": "libsvtav1",
+               "crf": 36, "preset": "8", "max_fps": 0, "audio_bitrate_kbps": 96,
+               "stall_seconds": 300, "timeout_factor": 12, "timeout_floor_seconds": 900},
     "tools": {"ffmpeg": "ffmpeg", "ffprobe": "ffprobe"},
     "google": {"cookies_file": ".photos-shrink/cookies.txt", "browser_profile": ".photos-shrink/browser",
                "browser_channel": "chrome", "browser_headless": True, "account_index": 0,
@@ -118,14 +129,18 @@ def load_config(path: str | os.PathLike[str] = "shrink.toml") -> Settings:
     for key in ("long_edge", "short_edge", "max_fps", "audio_bitrate_kbps"):
         _positive_int(values["videos"][key], f"videos.{key}")
     _positive_int(values["videos"]["crf"], "videos.crf")
-    if values["videos"]["crf"] > 51:
-        raise ConfigError("videos.crf must be between 0 and 51")
+    encoder = values["videos"]["encoder"]
+    if encoder not in VIDEO_ENCODERS:
+        raise ConfigError(f"videos.encoder must be one of {', '.join(sorted(VIDEO_ENCODERS))}")
+    highest_crf, presets = VIDEO_ENCODERS[encoder]
+    if values["videos"]["crf"] > highest_crf:
+        raise ConfigError(f"videos.crf must be between 0 and {highest_crf} for {encoder}")
     if values["videos"]["long_edge"] == 0 or values["videos"]["short_edge"] == 0:
         raise ConfigError("video dimensions must be positive")
     if values["videos"]["audio_bitrate_kbps"] == 0:
         raise ConfigError("videos.audio_bitrate_kbps must be positive")
-    if values["videos"]["preset"] not in {"ultrafast", "superfast", "veryfast", "faster", "fast", "medium", "slow", "slower", "veryslow", "placebo"}:
-        raise ConfigError("videos.preset is not a supported ffmpeg preset")
+    if str(values["videos"]["preset"]) not in presets:
+        raise ConfigError(f"videos.preset is not a supported preset for {encoder}")
     for key in ("pause_seconds", "threads"):
         _positive_int(values["run"][key], f"run.{key}")
     if values["run"]["threads"] == 0:
@@ -135,8 +150,8 @@ def load_config(path: str | os.PathLike[str] = "shrink.toml") -> Settings:
         raise ConfigError("run.minimum_savings_percent must be between 0 and 100")
     if values["photos"]["format"].lower() != "avif":
         raise ConfigError("photos.format currently supports only avif")
-    if values["videos"]["codec"].lower() != "hevc":
-        raise ConfigError("videos.codec currently supports only hevc")
+    if values["videos"]["codec"].lower() not in {"av1", "hevc"}:
+        raise ConfigError("videos.codec currently supports only av1 and hevc")
     try:
         ZoneInfo(values["exclude"]["timezone"])
     except (ZoneInfoNotFoundError, TypeError):

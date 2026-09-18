@@ -138,3 +138,42 @@ def test_data_dir_does_not_change_the_encoding_fingerprint(tmp_path: Path):
     original = load_config(path).fingerprint
     path.write_text("[run]\ndata_dir = 'G:/somewhere-else'\n", encoding="utf-8")
     assert load_config(path).fingerprint == original
+
+
+class TestVideoEncoderSettings:
+    """Each encoder's quality scale and presets are its own."""
+
+    def _config(self, tmp_path, body):
+        path = tmp_path / "shrink.toml"
+        path.write_text(f"[videos]\n{body}\n", encoding="utf-8")
+        return path
+
+    def test_av1_is_the_default_encoder(self, tmp_path):
+        settings = load_config(self._config(tmp_path, "crf = 36"))
+        assert settings.videos["encoder"] == "libsvtav1"
+        assert settings.videos["preset"] == "8"
+
+    def test_av1_accepts_a_crf_above_x265s_limit(self, tmp_path):
+        """AV1's scale runs to 63; 51 is x265's ceiling, not AV1's."""
+
+        assert load_config(self._config(tmp_path, "crf = 60")).videos["crf"] == 60
+
+    def test_x265_still_refuses_a_crf_above_51(self, tmp_path):
+        with pytest.raises(ConfigError, match="between 0 and 51"):
+            load_config(self._config(tmp_path, 'encoder = "libx265"\ncrf = 60\npreset = "slow"'))
+
+    def test_a_word_preset_is_refused_for_av1(self, tmp_path):
+        with pytest.raises(ConfigError, match="not a supported preset"):
+            load_config(self._config(tmp_path, 'preset = "slow"'))
+
+    def test_a_numeric_preset_is_refused_for_x265(self, tmp_path):
+        with pytest.raises(ConfigError, match="not a supported preset"):
+            load_config(self._config(tmp_path, 'encoder = "libx265"\ncrf = 30\npreset = "8"'))
+
+    def test_nvenc_takes_its_own_presets(self, tmp_path):
+        settings = load_config(self._config(tmp_path, 'encoder = "hevc_nvenc"\ncrf = 32\npreset = "p7"'))
+        assert settings.videos["preset"] == "p7"
+
+    def test_an_unknown_encoder_is_refused(self, tmp_path):
+        with pytest.raises(ConfigError, match="videos.encoder must be one of"):
+            load_config(self._config(tmp_path, 'encoder = "libmagic"'))
