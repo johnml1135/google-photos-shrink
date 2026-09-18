@@ -37,7 +37,13 @@ from .config import Settings
 from .integrity import sha256_file
 from .ledger import UploadRecord
 from .policy import Candidate, verdict
+from .remote import RemoteProtocolError
 from .takeout import EDIT_SUFFIX
+
+# How many failed reads in a row mean the session, not the photos. A batch is
+# 100 by default, so this trips on the first dead batch without firing on a
+# handful of genuinely missing originals.
+DEAD_SESSION_READS = 10
 
 
 class ReplaceError(RuntimeError):
@@ -208,7 +214,8 @@ class _Batch:
         `originals`: replacing never touches it, and removing acts only on it.
         """
 
-        self.progress(f"reading {len(self.live)} original(s)")
+        asked = len(self.live)
+        self.progress(f"reading {asked} original(s)")
         found = self.library.get_items([job.media_key for job in self.live.values()])
         for job in list(self.live.values()):
             item = found.get(job.media_key)
@@ -225,6 +232,15 @@ class _Batch:
             if blocked:
                 self.refused[job.key] = blocked
                 self.live.pop(job.key)
+
+        # Every read in a batch failing is a dead session, not a batch of
+        # missing photos. Live, an expired cookie answered 2,803 reads in a
+        # row with the same error while the run charged on through them, and
+        # each one spends an item that had to be tried again later.
+        if asked >= DEAD_SESSION_READS and not self.live and not self.refused:
+            raise RemoteProtocolError(
+                f"none of the {asked} originals in this batch could be read; the session is gone"
+            )
 
     def find_replacements(self) -> None:
         """Resolve each live job's replacement by the content hash of what was uploaded."""

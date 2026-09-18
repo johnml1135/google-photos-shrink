@@ -175,6 +175,32 @@ class TestWholeBatch:
         assert library.names() == ["get_items", "find_uploaded_many", "get_items", "trash_many", "in_bin"]
         assert len(library.trashed()) == 20
 
+    def test_a_batch_where_every_read_fails_stops_the_run(self, tmp_path):
+        """A dead session, not a batch of missing photos.
+
+        Live, an expired cookie answered 2,803 reads in a row with the same
+        error and the run charged through all of them, spending items that
+        then had to be tried again.
+        """
+
+        names = [f"n{i}" for i in range(12)]
+        jobs = [make_job(tmp_path, name, media_key=f"ORIG-{name}") for name in names]
+        library = library_for(*names)
+        for name in names:
+            library.items[f"ORIG-{name}"] = RemoteProtocolError("unsuccessful response rpc=VrseUb")
+        with pytest.raises(RemoteProtocolError, match="the session is gone"):
+            run(library, jobs, tmp_path)
+        assert library.trashed() == []
+
+    def test_a_few_unreadable_originals_do_not_stop_the_run(self, tmp_path):
+        names = [f"n{i}" for i in range(12)]
+        jobs = [make_job(tmp_path, name, media_key=f"ORIG-{name}") for name in names]
+        library = library_for(*names)
+        library.items["ORIG-n0"] = RemoteProtocolError("item identity is incomplete")
+        outcomes = run(library, jobs, tmp_path)
+        assert outcomes[jobs[0].key].status == "failed"
+        assert sum(1 for o in outcomes.values() if o.status == "replaced") == 11
+
     def test_one_failure_does_not_stop_the_rest(self, tmp_path):
         good = make_job(tmp_path, "good", media_key="ORIG-good")
         bad = make_job(tmp_path, "bad", media_key="ORIG-bad")
