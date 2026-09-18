@@ -38,7 +38,8 @@ DEFAULTS: dict[str, dict[str, Any]] = {
     "google": {"cookies_file": ".photos-shrink/cookies.txt", "browser_profile": ".photos-shrink/browser",
                "browser_channel": "chrome", "browser_headless": True, "account_index": 0,
                "session_refresh_seconds": 300},
-    "run": {"work_dir": ".photos-shrink", "data_dir": "", "pause_seconds": 10, "minimum_savings_percent": 20,
+    "run": {
+        "encode_workers": 1,"work_dir": ".photos-shrink", "data_dir": "", "pause_seconds": 10, "minimum_savings_percent": 20,
             "threads": 2, "skip_shared": True, "skip_non_space_consuming": True,
             "photos_only": False},
     "exclude": {"timezone": "America/New_York", "date_ranges": [], "name_globs": []},
@@ -141,8 +142,10 @@ def load_config(path: str | os.PathLike[str] = "shrink.toml") -> Settings:
         raise ConfigError("videos.audio_bitrate_kbps must be positive")
     if str(values["videos"]["preset"]) not in presets:
         raise ConfigError(f"videos.preset is not a supported preset for {encoder}")
-    for key in ("pause_seconds", "threads"):
+    for key in ("pause_seconds", "threads", "encode_workers"):
         _positive_int(values["run"][key], f"run.{key}")
+    if values["run"]["encode_workers"] == 0:
+        raise ConfigError("run.encode_workers must be at least 1")
     if values["run"]["threads"] == 0:
         raise ConfigError("run.threads must be at least 1")
     minimum = values["run"]["minimum_savings_percent"]

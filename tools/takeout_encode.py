@@ -19,6 +19,7 @@ import argparse
 import csv
 import sys
 import time
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
 from pathlib import Path
 
@@ -143,6 +144,10 @@ def main() -> int:
     )
     parser.add_argument("--report", type=Path, default=None)
     parser.add_argument("--no-resume", action="store_true", help="Re-encode even if output exists")
+    parser.add_argument(
+        "--workers", type=int, default=0,
+        help="Encodes to run at once (default: run.encode_workers)",
+    )
     args = parser.parse_args()
 
     config = load_config(args.config)
@@ -153,6 +158,10 @@ def main() -> int:
     target_dir.mkdir(parents=True, exist_ok=True)
     report_path = args.report or work / "encoded.csv"
     ffprobe = config.tools["ffprobe"]
+    # SVT-AV1 at 1080p uses about two cores however many threads it is given --
+    # measured, lp=8 was slower than the default -- so more of the machine is
+    # reached by encoding several videos at once, not by widening one encode.
+    workers = args.workers or int(config.run.get("encode_workers", 1) or 1)
 
     # Say where this run reads and writes before doing anything. A run aimed
     # at the wrong directory finds no outputs, concludes nothing was encoded,
@@ -181,12 +190,11 @@ def main() -> int:
     total_old = total_new = 0
     started = time.time()
 
-    for entry in entries:
-        if args.limit and (encoded + reused) >= args.limit:
-            break
-
+    # One item's work, off the main thread. Everything it needs is passed in;
+    # it touches no shared state and reports every outcome through its row, so
+    # a failure costs its own item and nothing else.
+    def encode_one(entry) -> tuple[dict, str, int]:
         candidate = Candidate.from_mirror_entry(entry)
-        token = verdict(config, candidate)
         row = {
             "source": str(entry.path),
             "media_key": entry.media_key or "",
@@ -194,15 +202,13 @@ def main() -> int:
             "taken_timestamp_ms": entry.taken_timestamp_ms or "",
             "old_bytes": entry.size_bytes,
         }
+        token = verdict(config, candidate)
         if token:
             row.update(status="skipped", reason=explain(token), output="")
-            rows.append(row)
-            skipped += 1
-            continue
+            return row, "skipped", 0
 
         output = output_path(entry, target_dir)
         row["output"] = str(output)
-
         reuse = output.exists() and output.stat().st_size > 0 and not args.no_resume
         try:
             if reuse:
@@ -218,10 +224,8 @@ def main() -> int:
             source_info = media.probe(entry.path, ffprobe)
         except Exception as exc:  # noqa: BLE001 - every outcome is recorded
             row.update(status="skipped", reason=f"{type(exc).__name__}: {exc}")
-            rows.append(row)
-            skipped += 1
             print(f"  SKIP {entry.path.name}: {type(exc).__name__}: {exc}", flush=True)
-            continue
+            return row, "skipped", 0
 
         new_bytes = output.stat().st_size
         saved = entry.size_bytes - new_bytes
@@ -236,9 +240,7 @@ def main() -> int:
                 saved_bytes=saved,
                 saved_percent=round(percent, 2),
             )
-            rows.append(row)
-            skipped += 1
-            continue
+            return row, "skipped", 0
         row.update(
             new_bytes=new_bytes,
             saved_bytes=saved,
@@ -248,27 +250,37 @@ def main() -> int:
             status="encoded",
             reason="reused existing output" if reuse else "",
         )
-        rows.append(row)
-        total_old += entry.size_bytes
-        total_new += new_bytes
-        if reuse:
-            reused += 1
-        else:
-            encoded += 1
+        return row, ("reused" if reuse else "encoded"), new_bytes
 
-        done = encoded + reused
-        if not reuse and done % 10 == 0:
-            elapsed = time.time() - started
-            remaining = (len(entries) - done) * (elapsed / max(1, encoded))
-            print(
-                f"  [{done:,}/{len(entries):,}] {entry.kind} "
-                f"{total_old / 1e9:.2f} GB -> {total_new / 1e9:.2f} GB "
-                f"({100 * (total_old - total_new) / max(1, total_old):.1f}% saved) "
-                f"~{format_duration(remaining)} left",
-                flush=True,
-            )
-        if len(rows) % FLUSH_EVERY == 0:
-            write_report(report_path, merge_report(original_rows, rows))
+    queued = entries[: args.limit] if args.limit else entries
+    if workers > 1:
+        print(f"  {workers} encodes at a time", flush=True)
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        for row, outcome, new_bytes in pool.map(encode_one, queued):
+            rows.append(row)
+            if outcome == "skipped":
+                skipped += 1
+            else:
+                total_old += int(row["old_bytes"])
+                total_new += new_bytes
+                if outcome == "reused":
+                    reused += 1
+                else:
+                    encoded += 1
+
+            done = encoded + reused
+            if outcome == "encoded" and done % 10 == 0:
+                elapsed = time.time() - started
+                remaining = (len(queued) - done) * (elapsed / max(1, encoded))
+                print(
+                    f"  [{done:,}/{len(queued):,}] "
+                    f"{total_old / 1e9:.2f} GB -> {total_new / 1e9:.2f} GB "
+                    f"({100 * (total_old - total_new) / max(1, total_old):.1f}% saved) "
+                    f"~{format_duration(remaining)} left",
+                    flush=True,
+                )
+            if len(rows) % FLUSH_EVERY == 0:
+                write_report(report_path, merge_report(original_rows, rows))
 
     write_report(report_path, merge_report(original_rows, rows))
     print(f"\n--- encoded {encoded:,}, reused {reused:,}, skipped {skipped:,} ---", flush=True)

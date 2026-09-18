@@ -73,6 +73,10 @@ minimum_savings_percent = 20
 # ffmpeg threads per video. This machine has 20 logical processors; at 2 a
 # 1080p CRF 30 encode crawls, and videos run one at a time anyway.
 threads = 12
+# Videos encode one at a time per worker. SVT-AV1 uses about two cores per
+# encode whatever thread count it is given, so four at a time is what reaches
+# eight of this machine's twenty logical processors.
+encode_workers = 4
 skip_shared = false
 skip_non_space_consuming = true
 photos_only = false
