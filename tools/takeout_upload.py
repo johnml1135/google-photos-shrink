@@ -166,19 +166,37 @@ def main() -> int:
     print("API credentials verified.", flush=True)
 
     if args.reverify:
-        for record in journal.all_records():
+        # Scoped by the report, like every other run of this tool. The journal
+        # holds every upload ever made; re-checking the 121 rows of
+        # encoded-videos.csv costs 121 requests, where the whole journal would
+        # spend 9,244 against a quota of 10,000 a day.
+        wanted = {row["output"] for row in rows}
+        scoped = [r for r in journal.all_records() if str(r.output) in wanted]
+        print(f"re-checking {len(scoped)} of {len(journal)} uploaded item(s)", flush=True)
+        for index, record in enumerate(scoped, 1):
             try:
                 stored = api.get_media_item(record.media_item_id)
             except PhotosApiError as exc:
-                record.verified, record.verified_detail = "unverified", str(exc)
+                # An API failure says nothing about the item, so the verdict
+                # already recorded stands. Overwriting it with "unverified"
+                # would strand a verified upload: only verified uploads are
+                # allowed to replace their original.
+                print(f"  {record.output.name}: not checked  {exc}", flush=True)
+                if exc.status == 429:
+                    print("  Quota is gone for the day; stopping.", file=sys.stderr)
+                    break
                 continue
             verdict, detail = verify_item(stored, record.output, ffprobe)
             record.verified, record.verified_detail = verdict, detail
             record.capture_time = (stored.get("mediaMetadata") or {}).get("creationTime")
             print(f"  {record.output.name}: {verdict}  {detail}", flush=True)
+            # Save as it goes: a pass that is interrupted keeps what it checked
+            # rather than spending the quota a second time.
+            if index % 50 == 0:
+                journal.save()
         journal.save()
-        ok = sum(1 for r in journal.all_records() if r.verified == "ok")
-        print(f"\n  verified {ok}/{len(journal)}; nothing was uploaded.", flush=True)
+        ok = sum(1 for r in scoped if r.verified == "ok")
+        print(f"\n  verified {ok}/{len(scoped)}; nothing was uploaded.", flush=True)
         return 0
 
     album_id = None

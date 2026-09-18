@@ -221,6 +221,18 @@ class TestReadBack:
         assert url.endswith("/v1/mediaItems/new-1")
         assert kwargs["headers"]["Authorization"] == "Bearer fresh-access"
 
+    def test_a_quota_failure_carries_its_status(self, tmp_path):
+        """A caller re-checking many items has to tell a per-item failure from
+        an account-wide one: past a 429 every later lookup fails too."""
+
+        session = Session()
+        session.post_responses = [access_ok()]
+        session.get_responses = [Response(429, {"error": {"message": "Quota exceeded"}})]
+        api = client(tmp_path, session)
+        with pytest.raises(PhotosApiError, match="Quota exceeded") as caught:
+            api.get_media_item("new-1")
+        assert caught.value.status == 429
+
 
 class TestLoadClientCredentials:
     def test_environment_wins(self, tmp_path, monkeypatch):

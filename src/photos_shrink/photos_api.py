@@ -62,7 +62,17 @@ MAX_ATTEMPTS = 4
 
 
 class PhotosApiError(RuntimeError):
-    """Raised when the Photos API cannot be used safely."""
+    """Raised when the Photos API cannot be used safely.
+
+    `status` is the HTTP status behind the failure when there was one. A
+    caller looping over many items needs to tell a per-item answer from an
+    account-wide one: a 429 means the day's quota is gone and every later
+    call in that loop will fail the same way.
+    """
+
+    def __init__(self, message: str, status: int | None = None) -> None:
+        super().__init__(message)
+        self.status = status
 
 
 def load_client_credentials(work_dir: str | os.PathLike[str]) -> tuple[str, str]:
@@ -301,7 +311,9 @@ class PhotosApiClient:
             message = (payload.get("error") or {})
             if isinstance(message, dict):
                 message = message.get("message") or message.get("status") or ""
-            raise PhotosApiError(f"{what} failed ({response.status_code}): {message}")
+            raise PhotosApiError(
+                f"{what} failed ({response.status_code}): {message}", status=response.status_code
+            )
         return payload
 
     def _headers(self, **extra: str) -> dict[str, str]:
