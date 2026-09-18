@@ -40,10 +40,11 @@ from .policy import Candidate, verdict
 from .remote import RemoteProtocolError
 from .takeout import EDIT_SUFFIX
 
-# How many failed reads in a row mean the session, not the photos. A batch is
-# 100 by default, so this trips on the first dead batch without firing on a
-# handful of genuinely missing originals.
+# What a dead session looks like from inside a batch: enough reads to judge by,
+# and most of them failing. A batch is 100 by default, so this trips on the
+# first rotten batch without firing on a handful of missing originals.
 DEAD_SESSION_READS = 10
+DEAD_SESSION_SHARE = 0.8
 
 
 class ReplaceError(RuntimeError):
@@ -233,13 +234,16 @@ class _Batch:
                 self.refused[job.key] = blocked
                 self.live.pop(job.key)
 
-        # Every read in a batch failing is a dead session, not a batch of
-        # missing photos. Live, an expired cookie answered 2,803 reads in a
-        # row with the same error while the run charged on through them, and
-        # each one spends an item that had to be tried again later.
-        if asked >= DEAD_SESSION_READS and not self.live and not self.refused:
+        # Reads failing wholesale is the session, not the photos. Live, an
+        # expired cookie answered 2,803 reads in a row with the same error
+        # while the run charged on through them; a later run rotted more
+        # slowly, losing 70-80% of each batch, which a test for "every read
+        # failed" never catches. Each lost read spends an item that has to be
+        # tried again, so the run stops and asks for a fresh cookie instead.
+        read = len(self.live) + len(self.refused)
+        if asked >= DEAD_SESSION_READS and read <= asked * (1 - DEAD_SESSION_SHARE):
             raise RemoteProtocolError(
-                f"none of the {asked} originals in this batch could be read; the session is gone"
+                f"only {read} of {asked} originals in this batch could be read; the session is gone"
             )
 
     def find_replacements(self) -> None:

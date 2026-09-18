@@ -192,6 +192,18 @@ class TestWholeBatch:
             run(library, jobs, tmp_path)
         assert library.trashed() == []
 
+    def test_a_batch_that_mostly_fails_to_read_stops_the_run(self, tmp_path):
+        """A session rots before it dies: one run lost 70-80% of every batch."""
+
+        names = [f"n{i}" for i in range(20)]
+        jobs = [make_job(tmp_path, name, media_key=f"ORIG-{name}") for name in names]
+        library = library_for(*names)
+        for name in names[:17]:
+            library.items[f"ORIG-{name}"] = RemoteProtocolError("unsuccessful response rpc=VrseUb")
+        with pytest.raises(RemoteProtocolError, match="the session is gone"):
+            run(library, jobs, tmp_path)
+        assert library.trashed() == []
+
     def test_a_few_unreadable_originals_do_not_stop_the_run(self, tmp_path):
         names = [f"n{i}" for i in range(12)]
         jobs = [make_job(tmp_path, name, media_key=f"ORIG-{name}") for name in names]
