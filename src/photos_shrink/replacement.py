@@ -40,11 +40,9 @@ from .policy import Candidate, verdict
 from .remote import RemoteProtocolError
 from .takeout import EDIT_SUFFIX
 
-# What a dead session looks like from inside a batch: enough reads to judge by,
-# and most of them failing. A batch is 100 by default, so this trips on the
-# first rotten batch without firing on a handful of missing originals.
+# How many reads a batch needs before "not one of them worked" means the
+# session rather than the photos. A batch is 100 by default.
 DEAD_SESSION_READS = 10
-DEAD_SESSION_SHARE = 0.8
 
 
 class ReplaceError(RuntimeError):
@@ -55,7 +53,7 @@ class ReplaceError(RuntimeError):
 class Outcome:
     """What happened, or would happen, to one job."""
 
-    status: str  # "replaced" | "would_replace" | "verified_original_kept" | "refused" | "failed"
+    status: str  # "replaced" | "would_replace" | "verified_original_kept" | "refused" | "gone" | "failed"
     detail: str
     original_media_key: str | None = None
 
@@ -186,6 +184,7 @@ class _Batch:
         self.live: dict[str, UploadRecord] = {}
         self.originals: dict[str, dict[str, Any]] = {}
         self.refused: dict[str, str] = {}
+        self.unreadable: dict[str, UploadRecord] = {}
         self.matches: dict[str, dict[str, str]] = {}
         self._check_disk(jobs)
 
@@ -221,7 +220,10 @@ class _Batch:
         for job in list(self.live.values()):
             item = found.get(job.media_key)
             if item is None or isinstance(item, Exception):
-                self.fail(job, f"original could not be read: {item or 'no response'}")
+                # Judged once the whole batch is in: alone it could be a sick
+                # session or an original that is no longer there.
+                self.unreadable[job.key] = job
+                self.live.pop(job.key, None)
                 continue
             try:
                 check_original(item, job, self.sizes.get(job.media_key or ""))
@@ -234,16 +236,16 @@ class _Batch:
                 self.refused[job.key] = blocked
                 self.live.pop(job.key)
 
-        # Reads failing wholesale is the session, not the photos. Live, an
-        # expired cookie answered 2,803 reads in a row with the same error
-        # while the run charged on through them; a later run rotted more
-        # slowly, losing 70-80% of each batch, which a test for "every read
-        # failed" never catches. Each lost read spends an item that has to be
-        # tried again, so the run stops and asks for a fresh cookie instead.
+        # Not one read in a whole batch getting through is the session, not
+        # the photos: an expired cookie once answered 2,803 reads in a row
+        # with the same error while the run charged on through them. A batch
+        # that reads some of its originals proves the session works, which is
+        # what lets the ones that failed be judged as gone rather than retried
+        # forever.
         read = len(self.live) + len(self.refused)
-        if asked >= DEAD_SESSION_READS and read <= asked * (1 - DEAD_SESSION_SHARE):
+        if asked >= DEAD_SESSION_READS and not read:
             raise RemoteProtocolError(
-                f"only {read} of {asked} originals in this batch could be read; the session is gone"
+                f"none of the {asked} originals in this batch could be read; the session is gone"
             )
 
     def find_replacements(self) -> None:
@@ -316,6 +318,23 @@ def replace_batch(
 
     # 5: the replacements.
     batch.find_replacements()
+
+    # 5b: originals that could not be read. The rest of the batch reading
+    # fine is the proof that the session works, so these are originals that
+    # are no longer in the library -- trashed by an earlier run whose confirm
+    # step failed, then emptied from the bin. Closing them destroys nothing:
+    # the replacement is confirmed present first, and a queue that keeps
+    # retrying them stalls on the same hundred items every run.
+    if batch.unreadable:
+        healthy = bool(batch.originals) or bool(batch.refused)
+        batch.progress(f"{len(batch.unreadable)} unreadable original(s)")
+        gone = library.find_uploaded_many([job.output for job in batch.unreadable.values()]) if healthy else {}
+        for key, job in batch.unreadable.items():
+            match = gone.get(job.output)
+            if match and not isinstance(match, Exception):
+                batch.outcomes[key] = Outcome("gone", "original is no longer in the library", job.media_key)
+            else:
+                batch.outcomes[key] = Outcome("failed", "original could not be read", job.media_key)
 
     def read_replacements(keys: list[str]) -> dict[str, dict[str, Any]]:
         found = library.get_items([batch.matches[key]["id"] for key in keys])
@@ -413,6 +432,10 @@ def remove_extra_copies(
 
     batch = _Batch(library, jobs, settings, progress, sizes)
     batch.read_originals()
+    for key, job in batch.unreadable.items():
+        # Removing a copy turns on the original being refused, which an
+        # unreadable original cannot show. Nothing is trashed on a guess.
+        batch.outcomes[key] = Outcome("failed", "original could not be read", job.media_key)
     for key, job in batch.live.items():
         batch.outcomes[key] = Outcome("kept", "the original is not refused", job.media_key)
     # From here on the jobs in play are the refused ones.

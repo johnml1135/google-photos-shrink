@@ -192,26 +192,41 @@ class TestWholeBatch:
             run(library, jobs, tmp_path)
         assert library.trashed() == []
 
-    def test_a_batch_that_mostly_fails_to_read_stops_the_run(self, tmp_path):
-        """A session rots before it dies: one run lost 70-80% of every batch."""
+    def test_an_original_that_is_no_longer_there_is_closed_not_retried(self, tmp_path):
+        """The rest of the batch reading fine proves the session works.
 
-        names = [f"n{i}" for i in range(20)]
+        Live, runs stalled on the same hundred items every time: originals
+        trashed by a run whose confirm step failed, then emptied from the bin.
+        Nothing is left to trash, so the record is closed -- but only once the
+        replacement is confirmed present.
+        """
+
+        names = [f"n{i}" for i in range(12)]
         jobs = [make_job(tmp_path, name, media_key=f"ORIG-{name}") for name in names]
         library = library_for(*names)
-        for name in names[:17]:
+        library.items["ORIG-n0"] = RemoteProtocolError("unsuccessful response rpc=VrseUb")
+        outcomes = run(library, jobs, tmp_path)
+        assert outcomes[jobs[0].key].status == "gone"
+        assert sum(1 for o in outcomes.values() if o.status == "replaced") == 11
+        assert "dedup-ORIG-n0" not in library.trashed()
+
+    def test_an_unreadable_original_whose_replacement_is_missing_still_fails(self, tmp_path):
+        names = [f"n{i}" for i in range(12)]
+        jobs = [make_job(tmp_path, name, media_key=f"ORIG-{name}") for name in names]
+        library = library_for(*names)
+        library.items["ORIG-n0"] = RemoteProtocolError("unsuccessful response rpc=VrseUb")
+        library.by_output.pop(jobs[0].output.name)
+        assert run(library, jobs, tmp_path)[jobs[0].key].status == "failed"
+
+    def test_a_batch_that_reads_nothing_stops_the_run(self, tmp_path):
+        names = [f"n{i}" for i in range(12)]
+        jobs = [make_job(tmp_path, name, media_key=f"ORIG-{name}") for name in names]
+        library = library_for(*names)
+        for name in names:
             library.items[f"ORIG-{name}"] = RemoteProtocolError("unsuccessful response rpc=VrseUb")
         with pytest.raises(RemoteProtocolError, match="the session is gone"):
             run(library, jobs, tmp_path)
         assert library.trashed() == []
-
-    def test_a_few_unreadable_originals_do_not_stop_the_run(self, tmp_path):
-        names = [f"n{i}" for i in range(12)]
-        jobs = [make_job(tmp_path, name, media_key=f"ORIG-{name}") for name in names]
-        library = library_for(*names)
-        library.items["ORIG-n0"] = RemoteProtocolError("item identity is incomplete")
-        outcomes = run(library, jobs, tmp_path)
-        assert outcomes[jobs[0].key].status == "failed"
-        assert sum(1 for o in outcomes.values() if o.status == "replaced") == 11
 
     def test_one_failure_does_not_stop_the_rest(self, tmp_path):
         good = make_job(tmp_path, "good", media_key="ORIG-good")
@@ -268,13 +283,15 @@ class TestOriginal:
         assert run(library, [job], tmp_path)[job.key].status == "failed"
         assert library.trashed() == []
 
-    def test_an_unreadable_original_fails(self, tmp_path):
+    def test_a_lone_unreadable_original_is_never_judged_gone(self, tmp_path):
+        """One job is no evidence about the session, so nothing is concluded."""
+
         job = make_job(tmp_path)
         library = library_for("one")
         library.items["ORIG-one"] = RemoteProtocolError("item identity is incomplete")
         outcome = run(library, [job], tmp_path)[job.key]
         assert outcome.status == "failed"
-        assert "item identity is incomplete" in outcome.detail
+        assert library.trashed() == []
 
     def test_a_missing_export_never_touches_the_library(self, tmp_path):
         job = make_job(tmp_path)

@@ -118,6 +118,12 @@ def main() -> int:
                         record.replace_error = outcome.detail
                     elif outcome.status == "refused":
                         record.replaced = f"refused: {outcome.detail}"
+                    elif outcome.status == "gone":
+                        # Nothing left to trash, so the record is closed
+                        # rather than retried by every later run.
+                        record.replaced = f"gone: {outcome.detail}"
+                        record.replaced_at = time.strftime("%Y-%m-%dT%H:%M:%S")
+                        record.replace_error = None
                     else:
                         record.replaced = outcome.status
                         record.original_media_key = outcome.original_media_key
