@@ -26,7 +26,7 @@ from photos_shrink.replacement import remove_extra_copies
 
 def main() -> int:
     parser = argparse.ArgumentParser(description="Trash replacements whose originals are refused")
-    parser.add_argument("--journal", type=Path, required=True)
+    parser.add_argument("--journal", type=Path, default=None, help="Defaults to <data_dir>/takeout-upload-journal.json")
     parser.add_argument("--config", default="shrink.toml")
     parser.add_argument("--limit", type=int, default=0)
     parser.add_argument("--batch", type=int, default=100, help="Items per batch (default 100)")
@@ -34,6 +34,9 @@ def main() -> int:
     parser.add_argument("--pause", type=float, default=1.0, help="Seconds between batches")
     args = parser.parse_args()
 
+    settings = load_config(args.config)
+    if args.journal is None:
+        args.journal = Path(settings.run["data_dir"]) / "takeout-upload-journal.json"
     if not args.journal.exists():
         print(f"No upload journal at {args.journal}.", file=sys.stderr)
         return 2
@@ -41,7 +44,6 @@ def main() -> int:
         print("--batch must be at least 1.", file=sys.stderr)
         return 2
     journal = UploadJournal.load(args.journal)
-    settings = load_config(args.config)
     exported_sizes = load_exported_sizes(Path(settings.run["data_dir"]) / "mirror.csv")
 
     todo = journal.copy_removal_candidates()

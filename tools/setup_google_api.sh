@@ -261,7 +261,7 @@ stage "Grant access to your photos"
 say "Now you approve this tool against your own account, once."
 if [[ -z "$PY" ]]; then
   warn "No Python found. Run this yourself, then re-run the wizard:"
-  note "  uv run python tools/api_setup.py"
+  note "  uv run photos-shrink api-setup"
   exit 1
 fi
 step "A browser tab will open on Google's consent screen."
@@ -271,7 +271,7 @@ step "  'Go to <your app name> (unsafe)'. It is your own app."
 step "Approve the requested Photos permissions."
 pause "Press Enter to start the consent flow."
 export PHOTOS_API_CLIENT_ID PHOTOS_API_CLIENT_SECRET
-if ! "$PY" tools/api_setup.py; then
+if ! "$PY" -m photos_shrink.steps.api_setup; then
   warn "Authorization did not complete. Re-run this wizard to try again."
   exit 1
 fi
@@ -280,7 +280,7 @@ fi
 stage "Verify the stored credentials"
 say "Checking the saved token actually works, so failure surfaces now"
 say "rather than part way through an upload."
-if "$PY" tools/api_setup.py --check; then
+if "$PY" -m photos_shrink.steps.api_setup --check; then
   say ""
   printf '  %s✓ The API is ready. No cookies needed for uploading.%s\n' "$GREEN" "$RESET"
 else

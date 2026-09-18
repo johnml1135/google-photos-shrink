@@ -1,6 +1,6 @@
 """Schema and I/O for the Takeout upload journal.
 
-`tools/takeout_upload.py` records one entry per uploaded file, keyed by its
+`photos-shrink upload` records one entry per uploaded file, keyed by its
 output path, so a later pass can verify and then replace the corresponding
 original. Until now that schema existed only as string literals at the write
 site (`takeout_upload.py`) and was read back by hand in at least one other
@@ -23,7 +23,7 @@ from dataclasses import dataclass, field, fields
 from pathlib import Path
 
 # Written together, unconditionally, every time the uploader records a new
-# entry (see tools/takeout_upload.py). Always present in a fresh record,
+# entry (see photos_shrink/steps/upload.py). Always present in a fresh record,
 # even when the value is None (e.g. mime_type), matching the journal's
 # existing shape.
 _CORE_FIELDS = (

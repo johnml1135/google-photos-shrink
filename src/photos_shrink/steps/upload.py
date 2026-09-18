@@ -1,6 +1,6 @@
 """Upload encoded Takeout replacements through the official Photos API.
 
-Reads the CSV written by tools/takeout_encode.py, uploads each encoded file,
+Reads the CSV written by `photos-shrink encode`, uploads each encoded file,
 verifies the created item by reading it back, and records the result so a later
 pass can delete the corresponding originals.
 
@@ -94,7 +94,7 @@ def main() -> int:
     if args.report is None:
         args.report = Path(settings.run["data_dir"]) / "encoded.csv"
     if not args.report.exists():
-        print(f"No encode report at {args.report}. Run tools/takeout_encode.py first.", file=sys.stderr)
+        print(f"No encode report at {args.report}. Run `photos-shrink encode` first.", file=sys.stderr)
         return 2
 
     with open(args.report, encoding="utf-8") as handle:
@@ -108,7 +108,7 @@ def main() -> int:
     origins = load_origins(mirror_path)
     if origins is None:
         print(
-            f"{mirror_path} has no origin column. Re-run tools/takeout_mirror.py so uploads "
+            f"{mirror_path} has no origin column. Re-run `photos-shrink mirror` so uploads "
             "can refuse photos shared in by someone else.",
             file=sys.stderr,
         )

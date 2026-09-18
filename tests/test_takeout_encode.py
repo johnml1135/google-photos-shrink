@@ -13,17 +13,11 @@ The tests below are written against that gap first.
 
 from __future__ import annotations
 
-import importlib.util
-import sys
 from pathlib import Path
 
 import pytest
 
-MODULE = Path(__file__).resolve().parents[1] / "tools" / "takeout_encode.py"
-spec = importlib.util.spec_from_file_location("takeout_encode", MODULE)
-takeout_encode = importlib.util.module_from_spec(spec)
-sys.modules["takeout_encode"] = takeout_encode
-spec.loader.exec_module(takeout_encode)
+from photos_shrink.steps import encode as takeout_encode
 
 merge_report = takeout_encode.merge_report
 

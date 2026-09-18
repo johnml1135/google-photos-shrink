@@ -77,7 +77,11 @@ threads = 12
 # encode whatever thread count it is given, so four at a time is what reaches
 # eight of this machine's twenty logical processors.
 encode_workers = 4
-skip_shared = false
+# Google refuses to add an item to a shared album, so an original that lives
+# in one cannot be replaced without dropping the photo out of an album other
+# people see. With this off, 145 such items failed the same album write on
+# every run; on, they are refused and keep their originals.
+skip_shared = true
 skip_non_space_consuming = true
 photos_only = false
 

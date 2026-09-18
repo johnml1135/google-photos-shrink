@@ -2,7 +2,7 @@
 
 The tools are scripts: nothing imports them, most of their main() has no test,
 and ruff cannot tell that `takeout.sha256` names a function that is gone. So a
-dead-code pass removed `takeout.sha256` while `tools/takeout_upload.py` still
+dead-code pass removed `takeout.sha256` while the upload step still
 called it -- `--help` worked, every test passed, and the first real upload
 would have died with an AttributeError.
 
@@ -20,7 +20,7 @@ from pathlib import Path
 
 import pytest
 
-TOOLS = sorted((Path(__file__).resolve().parents[1] / "tools").glob("*.py"))
+TOOLS = sorted((Path(__file__).resolve().parents[1] / "src" / "photos_shrink" / "steps").glob("*.py"))
 
 
 def _references(source: str) -> list[tuple[str, str]]:

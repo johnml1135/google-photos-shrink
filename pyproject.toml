@@ -16,6 +16,9 @@ dependencies = [
   "tzdata>=2024.1",
 ]
 
+[project.scripts]
+photos-shrink = "photos_shrink.cli:main"
+
 [dependency-groups]
 dev = ["pytest>=8", "ruff>=0.6"]
 

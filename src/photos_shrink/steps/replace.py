@@ -37,7 +37,7 @@ def _load_mirror_keys(mirror_path: Path) -> dict[str, str]:
 
 def main() -> int:
     parser = argparse.ArgumentParser(description="Fix replacement metadata and trash replaced originals")
-    parser.add_argument("--journal", type=Path, required=True)
+    parser.add_argument("--journal", type=Path, default=None, help="Defaults to <data_dir>/takeout-upload-journal.json")
     parser.add_argument("--mirror", type=Path, default=None)
     parser.add_argument("--config", default="shrink.toml")
     parser.add_argument("--limit", type=int, default=0)
@@ -50,6 +50,9 @@ def main() -> int:
     parser.add_argument("--pause", type=float, default=1.0, help="Seconds between batches")
     args = parser.parse_args()
 
+    settings = load_config(args.config)
+    if args.journal is None:
+        args.journal = Path(settings.run["data_dir"]) / "takeout-upload-journal.json"
     if not args.journal.exists():
         print(f"No upload journal at {args.journal}.", file=sys.stderr)
         return 2
@@ -58,7 +61,6 @@ def main() -> int:
         return 2
     journal = UploadJournal.load(args.journal)
 
-    settings = load_config(args.config)
     data_dir = Path(settings.run["data_dir"])
     mirror_path = args.mirror or data_dir / "mirror.csv"
     mirror_keys = _load_mirror_keys(mirror_path)

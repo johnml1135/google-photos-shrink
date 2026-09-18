@@ -11,7 +11,7 @@ from photos_shrink.ledger import UploadJournal, UploadRecord
 
 
 def raw_entry(**overrides) -> dict:
-    """A journal entry exactly as tools/takeout_upload.py writes one."""
+    """A journal entry exactly as `photos-shrink upload` writes one."""
 
     entry = {
         "source": "G:\\takeout-extracted\\Takeout\\Google Photos\\Photos from 2019\\IMG_0001.jpg",
