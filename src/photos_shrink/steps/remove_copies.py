@@ -21,7 +21,7 @@ from photos_shrink.config import load_config
 from photos_shrink.ledger import UploadJournal
 from photos_shrink.mirror_sizes import load_exported_sizes
 from photos_shrink.remote import COOKIE_HINT, RemoteProtocolError, open_session
-from photos_shrink.replacement import remove_extra_copies
+from photos_shrink.replacement import SessionWatch, remove_extra_copies
 
 
 def main() -> int:
@@ -57,6 +57,8 @@ def main() -> int:
         print("\nDRY RUN -- nothing will be changed. Re-run with --apply.\n", flush=True)
 
     counts: dict[str, int] = {}
+    # One watch for the run: a dead session is many empty batches, at any size.
+    watch = SessionWatch()
     started = time.monotonic()
     try:
         with open_session(settings) as remote:
@@ -66,7 +68,7 @@ def main() -> int:
                 label = f"[{start + 1}-{start + len(batch)}/{len(todo)}]"
                 try:
                     outcomes = remove_extra_copies(
-                        remote, batch, settings=settings, apply=args.apply, sizes=exported_sizes,
+                        remote, batch, settings=settings, apply=args.apply, sizes=exported_sizes, watch=watch,
                         progress=lambda message, label=label: print(f"{label} {message}", flush=True),
                     )
                 except RemoteProtocolError as exc:
@@ -79,9 +81,8 @@ def main() -> int:
                     if outcome.status != "kept":
                         name = record.source.name if record.source else "?"
                         print(f"  {name}: {outcome.status.upper()} {outcome.detail}", flush=True)
-                    if args.apply and outcome.status == "copy_removed":
-                        record.replaced = f"refused: {outcome.detail}"
-                        record.copy_removed_at = time.strftime("%Y-%m-%dT%H:%M:%S")
+                    if args.apply:
+                        journal.apply(record, outcome)
                 if args.apply:
                     journal.save()
                 if args.pause and start + args.batch < len(todo):

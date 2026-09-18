@@ -19,8 +19,33 @@ touched keeps the exact shape the uploader gave it, with no new keys.
 from __future__ import annotations
 
 import json
+import time
 from dataclasses import dataclass, field, fields
 from pathlib import Path
+from typing import Any
+
+# What `replaced` may hold, and which of those values settle a record. A
+# settled record has nothing left to trash: the original is gone, by this
+# tool's hand or someone else's. A refused or duplicate upload is the other
+# case -- the original stays, so the copy this tool made is an extra copy
+# until `copy_removed_at` says otherwise.
+REPLACED = "replaced"
+GONE = "gone"
+REFUSED = "refused"
+DUPLICATE = "duplicate"
+SETTLED = (REPLACED, GONE)
+
+# Outcomes that describe a pass which changed nothing: a dry run, or a check
+# that deliberately kept the original.
+UNCHANGED = frozenset({"would_replace", "would_remove_copy", "verified_original_kept", "kept"})
+
+
+def settled(replaced: str | None) -> bool:
+    """Whether a `replaced` value means there is nothing left to trash."""
+
+    if not replaced:
+        return False
+    return replaced == REPLACED or replaced.split(":", 1)[0] in SETTLED
 
 # Written together, unconditionally, every time the uploader records a new
 # entry (see photos_shrink/steps/upload.py). Always present in a fresh record,
@@ -214,12 +239,53 @@ class UploadJournal:
         ]
 
     def copy_removal_candidates(self) -> list[UploadRecord]:
-        """Uploads whose original has not been replaced and whose copy is still there.
+        """Uploads whose original still stands and whose copy is still there.
 
-        Pending and refused alike: the live gate decides which are extra copies.
+        Pending and refused alike: the live gate decides which are extra
+        copies. A settled record is not offered again -- it was testing
+        `replaced != "replaced"`, so the 705 records closed as gone in one
+        run came back as candidates on every run after it.
         """
 
         return [
             r for r in self._records.values()
-            if r.replaced != "replaced" and not r.copy_removed_at
+            if not settled(r.replaced) and not r.copy_removed_at
         ]
+
+    def apply(self, record: UploadRecord, outcome: Any, *, at: str | None = None) -> None:
+        """Write one outcome from the replace or remove-copies pass onto a record.
+
+        The only way a record changes stage. The mapping lived in the step
+        modules, which is where the `refused: ` and `gone: ` conventions were
+        minted -- read back here by string comparison, and silently wrong the
+        first time a status was added without the step being taught about it.
+
+        `outcome` is anything carrying `status`, `detail` and
+        `original_media_key`; taking it by shape keeps this module free of a
+        dependency on the pass that produces it.
+        """
+
+        stamp = at or time.strftime("%Y-%m-%dT%H:%M:%S")
+        status, detail = outcome.status, outcome.detail
+        if status in UNCHANGED:
+            return
+        if status == "failed":
+            record.replace_error = detail
+            return
+        if status == "copy_removed":
+            record.replaced = f"{REFUSED}: {detail}"
+            record.copy_removed_at = stamp
+            return
+        if status in (REFUSED, GONE):
+            record.replaced = f"{status}: {detail}"
+        elif status == REPLACED:
+            record.replaced = status
+            record.original_media_key = outcome.original_media_key
+        else:
+            # Better a visible open record than a silent misfiling: a status
+            # this module has not been taught is the code disagreeing with
+            # itself, and `test_ledger.py` fails on it before a run can.
+            record.replace_error = f"unknown outcome: {status}"
+            return
+        record.replaced_at = stamp
+        record.replace_error = None

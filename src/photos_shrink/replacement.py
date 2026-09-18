@@ -40,9 +40,44 @@ from .policy import Candidate, verdict
 from .remote import RemoteProtocolError
 from .takeout import EDIT_SUFFIX
 
-# How many reads a batch needs before "not one of them worked" means the
-# session rather than the photos. A batch is 100 by default.
+# How many originals must fail to read, with none succeeding, before that
+# means the session rather than the photos.
 DEAD_SESSION_READS = 10
+
+
+class SessionWatch:
+    """How a run tells a dead session from a photo that is no longer there.
+
+    Counted across the run, not within one batch. As a per-batch test it read
+    `asked >= DEAD_SESSION_READS`, so `--batch 5` never reached the floor and
+    silently ran with no guard at all -- the exact behaviour the guard was
+    added to stop, at a batch size the tool offers.
+
+    One read getting through is proof the session works, which is what lets
+    the failures beside it be judged as gone rather than retried forever.
+    """
+
+    def __init__(self, floor: int = DEAD_SESSION_READS) -> None:
+        self.floor = floor
+        self.unread = 0
+
+    def note(self, *, asked: int, read: int) -> None:
+        """Record one batch's reads. Raises once the session looks gone."""
+
+        if read:
+            self.unread = 0
+            return
+        self.unread += asked
+        if self.unread >= self.floor:
+            raise RemoteProtocolError(
+                f"{self.unread} originals in a row could not be read; the session is gone"
+            )
+
+    @property
+    def healthy(self) -> bool:
+        """Whether reads are getting through, so failures can be judged."""
+
+        return self.unread == 0
 
 
 class ReplaceError(RuntimeError):
@@ -176,8 +211,10 @@ class _Batch:
     """
 
     def __init__(self, library: Any, jobs: list[UploadRecord], settings: Settings,
-                 progress: Callable[[str], None], sizes: dict[str, set[int]] | None = None):
+                 progress: Callable[[str], None], sizes: dict[str, set[int]] | None = None,
+                 watch: SessionWatch | None = None):
         self.library, self.settings, self.progress = library, settings, progress
+        self.watch = watch or SessionWatch()
         self.sizes = sizes or {}
         self.jobs = {job.key: job for job in jobs}
         self.outcomes: dict[str, Outcome] = {}
@@ -236,17 +273,10 @@ class _Batch:
                 self.refused[job.key] = blocked
                 self.live.pop(job.key)
 
-        # Not one read in a whole batch getting through is the session, not
-        # the photos: an expired cookie once answered 2,803 reads in a row
-        # with the same error while the run charged on through them. A batch
-        # that reads some of its originals proves the session works, which is
-        # what lets the ones that failed be judged as gone rather than retried
-        # forever.
-        read = len(self.live) + len(self.refused)
-        if asked >= DEAD_SESSION_READS and not read:
-            raise RemoteProtocolError(
-                f"none of the {asked} originals in this batch could be read; the session is gone"
-            )
+        # Reads failing wholesale is the session, not the photos: an expired
+        # cookie once answered 2,803 reads in a row with the same error while
+        # the run charged on through them.
+        self.watch.note(asked=asked, read=len(self.live) + len(self.refused))
 
     def find_replacements(self) -> None:
         """Resolve each live job's replacement by the content hash of what was uploaded."""
@@ -279,11 +309,17 @@ class _Batch:
         self.progress(f"trashing {len(self.live)} item(s)")
         try:
             self.library.trash_many(list(dict.fromkeys(dedup_of(key) for key in self.live)))
+            # Confirming belongs inside the guard with the trash it confirms.
+            # Outside it, a failed confirm raised past this whole batch, the
+            # step caught it and broke out of its loop, and the journal was
+            # never saved: the originals were trashed on the server while the
+            # journal still read pending, and the next run -- unable to read
+            # them -- closed them as gone.
+            binned = self.library.in_bin([dedup_of(key) for key in self.live])
         except Exception as exc:  # noqa: BLE001 - recorded against every job in the call
             for job in list(self.live.values()):
                 self.fail(job, f"trash failed: {type(exc).__name__}: {exc}")
             return
-        binned = self.library.in_bin([dedup_of(key) for key in self.live])
         for key, job in list(self.live.items()):
             if dedup_of(key) in binned:
                 self.outcomes[key] = Outcome(status, detail(key), job.media_key)
@@ -300,6 +336,7 @@ def replace_batch(
     keep_originals: bool,
     progress: Callable[[str], None] = lambda message: None,
     sizes: dict[str, set[int]] | None = None,
+    watch: SessionWatch | None = None,
 ) -> dict[str, Outcome]:
     """Replace a batch of jobs; return each job's outcome, keyed by `UploadRecord.key`.
 
@@ -308,7 +345,7 @@ def replace_batch(
     fake in tests. A failure is recorded against its own job and never stops the rest.
     """
 
-    batch = _Batch(library, jobs, settings, progress, sizes)
+    batch = _Batch(library, jobs, settings, progress, sizes, watch)
     live, fail = batch.live, batch.fail
 
     # 3-4: the originals.
@@ -326,7 +363,7 @@ def replace_batch(
     # the replacement is confirmed present first, and a queue that keeps
     # retrying them stalls on the same hundred items every run.
     if batch.unreadable:
-        healthy = bool(batch.originals) or bool(batch.refused)
+        healthy = batch.watch.healthy
         batch.progress(f"{len(batch.unreadable)} unreadable original(s)")
         gone = library.find_uploaded_many([job.output for job in batch.unreadable.values()]) if healthy else {}
         for key, job in batch.unreadable.items():
@@ -416,6 +453,7 @@ def remove_extra_copies(
     apply: bool,
     progress: Callable[[str], None] = lambda message: None,
     sizes: dict[str, set[int]] | None = None,
+    watch: SessionWatch | None = None,
 ) -> dict[str, Outcome]:
     """Trash the replacements whose originals are refused; return each job's outcome.
 
@@ -430,7 +468,7 @@ def remove_extra_copies(
     "kept" (the original is not refused), "failed".
     """
 
-    batch = _Batch(library, jobs, settings, progress, sizes)
+    batch = _Batch(library, jobs, settings, progress, sizes, watch)
     batch.read_originals()
     for key, job in batch.unreadable.items():
         # Removing a copy turns on the original being refused, which an

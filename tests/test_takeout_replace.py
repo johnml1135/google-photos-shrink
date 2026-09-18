@@ -20,6 +20,7 @@ from photos_shrink.ledger import UploadRecord
 from photos_shrink.remote import RemoteProtocolError
 from photos_shrink.replacement import (
     ReplaceError,
+    SessionWatch,
     check_original,
     needed_fixes,
     remove_extra_copies,
@@ -45,6 +46,7 @@ class FakeLibrary:
     fix_errors: dict[str, Exception] = field(default_factory=dict)
     trash_takes: bool = True
     trash_error: Exception | None = None
+    bin_error: Exception | None = None
     bin: set[str] = field(default_factory=set)
     calls: list[tuple] = field(default_factory=list)
 
@@ -86,6 +88,8 @@ class FakeLibrary:
 
     def in_bin(self, dedup_keys):
         self.calls.append(("in_bin", list(dedup_keys)))
+        if self.bin_error:
+            raise self.bin_error
         return set(dedup_keys) & self.bin
 
     def names(self):
@@ -148,10 +152,10 @@ def library_for(*names: str, **kwargs) -> FakeLibrary:
     return library
 
 
-def run(library, jobs, tmp_path, *, apply=True, keep_originals=False, **run_settings):
+def run(library, jobs, tmp_path, *, apply=True, keep_originals=False, watch=None, **run_settings):
     return replace_batch(
         library, jobs, settings=settings_for(tmp_path, **run_settings),
-        apply=apply, keep_originals=keep_originals,
+        apply=apply, keep_originals=keep_originals, watch=watch,
     )
 
 
@@ -491,6 +495,23 @@ class TestTrash:
         outcome = run(library, [job], tmp_path)[job.key]
         assert (outcome.status, outcome.detail) == ("failed", "trash was not confirmed by the server")
 
+    def test_a_failed_confirmation_is_an_outcome_not_a_raise(self, tmp_path):
+        """The trash landed; only the confirmation failed.
+
+        Live, confirming sat outside the guard: the raise went past this
+        function, the step caught it and broke out of its loop, and the
+        journal was never saved. The originals were gone from the library
+        while the journal still read pending, and the next run closed them
+        as gone. Every job must come back as an outcome instead.
+        """
+
+        jobs = [make_job(tmp_path, n, media_key=f"ORIG-{n}") for n in ("a", "b")]
+        library = library_for("a", "b", bin_error=RemoteProtocolError("rpc=zy0IHe"))
+        outcomes = run(library, jobs, tmp_path)
+        assert {o.status for o in outcomes.values()} == {"failed"}
+        assert all("trash failed" in o.detail for o in outcomes.values())
+        assert set(outcomes) == {job.key for job in jobs}
+
     def test_a_trash_error_fails_the_whole_call_without_confirming(self, tmp_path):
         jobs = [make_job(tmp_path, n, media_key=f"ORIG-{n}") for n in ("a", "b")]
         library = library_for("a", "b", trash_error=RemoteProtocolError("rpc=XwAOJf"))
@@ -655,3 +676,54 @@ class TestAnEditedOriginal:
         outcomes = replace_batch(library, [job], settings=settings_for(tmp_path), apply=True,
                                  keep_originals=False, sizes={"ORIG-one": {999}})
         assert outcomes[job.key].status == "replaced"
+
+
+class TestSessionWatch:
+    """Telling a dead session from a photo that is no longer there."""
+
+    def test_a_batch_that_reads_nothing_stops_the_run(self):
+        watch = SessionWatch()
+        with pytest.raises(RemoteProtocolError, match="the session is gone"):
+            watch.note(asked=100, read=0)
+
+    def test_small_batches_still_reach_the_floor(self):
+        """As a per-batch test, `--batch 5` never reached it and ran unguarded."""
+
+        watch = SessionWatch()
+        watch.note(asked=5, read=0)
+        with pytest.raises(RemoteProtocolError, match="10 originals in a row"):
+            watch.note(asked=5, read=0)
+
+    def test_one_read_getting_through_clears_the_streak(self):
+        watch = SessionWatch()
+        watch.note(asked=9, read=0)
+        watch.note(asked=9, read=1)
+        assert watch.healthy
+        watch.note(asked=9, read=0)  # the streak restarts rather than tipping over
+
+    def test_a_few_missing_photos_never_stop_a_working_session(self):
+        watch = SessionWatch()
+        for _ in range(50):
+            watch.note(asked=100, read=97)
+        assert watch.healthy
+
+    def test_a_run_of_single_item_batches_is_still_judged(self, tmp_path):
+        watch = SessionWatch()
+        for _ in range(9):
+            watch.note(asked=1, read=0)
+        with pytest.raises(RemoteProtocolError):
+            watch.note(asked=1, read=0)
+
+    def test_the_watch_carries_across_batches_of_jobs(self, tmp_path):
+        """Two half-batches of a dead session add up to one stopped run."""
+
+        watch = SessionWatch()
+        names = [f"n{i}" for i in range(12)]
+        jobs = [make_job(tmp_path, name, media_key=f"ORIG-{name}") for name in names]
+        library = library_for(*names)
+        for name in names:
+            library.items[f"ORIG-{name}"] = RemoteProtocolError("unsuccessful response rpc=VrseUb")
+        run(library, jobs[:6], tmp_path, watch=watch)  # 6 unread: under the floor, no verdict
+        with pytest.raises(RemoteProtocolError, match="the session is gone"):
+            run(library, jobs[6:], tmp_path, watch=watch)  # 12 in a row: gone
+        assert library.trashed() == []

@@ -22,7 +22,7 @@ from photos_shrink.config import load_config
 from photos_shrink.ledger import UploadJournal
 from photos_shrink.mirror_sizes import load_exported_sizes
 from photos_shrink.remote import COOKIE_HINT, RemoteProtocolError, open_session
-from photos_shrink.replacement import replace_batch
+from photos_shrink.replacement import SessionWatch, replace_batch
 
 
 def _load_mirror_keys(mirror_path: Path) -> dict[str, str]:
@@ -88,6 +88,8 @@ def main() -> int:
     ]
 
     counts: dict[str, int] = {}
+    # One watch for the run: a dead session is many empty batches, at any size.
+    watch = SessionWatch()
     started = time.monotonic()
     try:
         with open_session(settings) as remote:
@@ -99,7 +101,7 @@ def main() -> int:
                 try:
                     outcomes = replace_batch(
                         remote, batch, settings=settings, apply=args.apply,
-                        keep_originals=args.keep_originals, sizes=exported_sizes,
+                        keep_originals=args.keep_originals, sizes=exported_sizes, watch=watch,
                         progress=lambda message, label=label: print(f"{label} {message}", flush=True),
                     )
                 except RemoteProtocolError as exc:
@@ -114,23 +116,8 @@ def main() -> int:
                     name = record.source.name if record.source else "?"
                     counts[outcome.status] = counts.get(outcome.status, 0) + 1
                     print(f"  {name}: {outcome.status.upper()} {outcome.detail}", flush=True)
-                    if not args.apply or outcome.status == "verified_original_kept":
-                        continue
-                    if outcome.status == "failed":
-                        record.replace_error = outcome.detail
-                    elif outcome.status == "refused":
-                        record.replaced = f"refused: {outcome.detail}"
-                    elif outcome.status == "gone":
-                        # Nothing left to trash, so the record is closed
-                        # rather than retried by every later run.
-                        record.replaced = f"gone: {outcome.detail}"
-                        record.replaced_at = time.strftime("%Y-%m-%dT%H:%M:%S")
-                        record.replace_error = None
-                    else:
-                        record.replaced = outcome.status
-                        record.original_media_key = outcome.original_media_key
-                        record.replaced_at = time.strftime("%Y-%m-%dT%H:%M:%S")
-                        record.replace_error = None
+                    if args.apply:
+                        journal.apply(record, outcome)
                 if args.apply:
                     journal.save()
                 print(f"{label} done in {time.monotonic() - batch_started:.1f}s", flush=True)

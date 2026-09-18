@@ -7,7 +7,7 @@ from pathlib import Path
 
 import pytest
 
-from photos_shrink.ledger import UploadJournal, UploadRecord
+from photos_shrink.ledger import UNCHANGED, UploadJournal, UploadRecord, settled
 
 
 def raw_entry(**overrides) -> dict:
@@ -357,16 +357,24 @@ class TestCopyRemoval:
             journal.record(UploadRecord(output=Path(f"{name}.avif"), verified="ok", **values))
         return journal
 
-    def test_candidates_are_every_upload_not_replaced_and_not_yet_removed(self, tmp_path):
+    def test_candidates_are_every_upload_whose_original_still_stands(self, tmp_path):
         journal = self._journal(
             tmp_path,
             pending={},
             refused={"replaced": "refused: non_space_consuming"},
             replaced={"replaced": "replaced"},
+            gone={"replaced": "gone: original is no longer in the library"},
             removed={"replaced": "refused: non_space_consuming", "copy_removed_at": "2026-09-17T10:00:00"},
         )
         names = sorted(r.output.stem for r in journal.copy_removal_candidates())
         assert names == ["pending", "refused"]
+
+    def test_a_settled_record_is_never_offered_again(self, tmp_path):
+        """705 records closed as gone in one run came back as candidates on
+        every run after it, because the test was `replaced != "replaced"`."""
+
+        journal = self._journal(tmp_path, gone={"replaced": "gone: original is no longer in the library"})
+        assert journal.copy_removal_candidates() == []
 
     def test_a_removed_copy_is_never_pending_replacement(self, tmp_path):
         journal = self._journal(tmp_path, removed={"copy_removed_at": "2026-09-17T10:00:00"})
@@ -376,3 +384,93 @@ class TestCopyRemoval:
         journal = self._journal(tmp_path, removed={"copy_removed_at": "2026-09-17T10:00:00"})
         reloaded = UploadJournal.load(journal.path)
         assert reloaded.all_records()[0].copy_removed_at == "2026-09-17T10:00:00"
+
+
+class _Outcome:
+    """An outcome by shape, as `replace_batch` and `remove_extra_copies` produce it."""
+
+    def __init__(self, status, detail="", original_media_key=None):
+        self.status, self.detail, self.original_media_key = status, detail, original_media_key
+
+
+class TestApplyingAnOutcome:
+    def _record(self, **values):
+        return UploadRecord(output=Path("one.avif"), verified="ok", **values)
+
+    def _journal(self, tmp_path):
+        return UploadJournal(tmp_path / "j.json")
+
+    def test_a_replacement_closes_the_record_and_keeps_the_original_key(self, tmp_path):
+        record = self._record()
+        self._journal(tmp_path).apply(record, _Outcome("replaced", "replaced, original trashed", "ORIG-1"), at="T")
+        assert (record.replaced, record.original_media_key, record.replaced_at) == ("replaced", "ORIG-1", "T")
+        assert settled(record.replaced)
+
+    def test_a_refusal_keeps_the_upload_as_an_extra_copy(self, tmp_path):
+        record = self._record()
+        self._journal(tmp_path).apply(record, _Outcome("refused", "non_space_consuming"), at="T")
+        assert record.replaced == "refused: non_space_consuming"
+        assert not settled(record.replaced)
+
+    def test_a_vanished_original_settles_the_record(self, tmp_path):
+        """Nothing is left to trash, so no later pass should offer it again."""
+
+        record = self._record()
+        self._journal(tmp_path).apply(record, _Outcome("gone", "original is no longer in the library"), at="T")
+        assert record.replaced == "gone: original is no longer in the library"
+        assert settled(record.replaced)
+
+    def test_a_removed_copy_records_when_it_went(self, tmp_path):
+        record = self._record()
+        self._journal(tmp_path).apply(record, _Outcome("copy_removed", "non_space_consuming"), at="T")
+        assert (record.replaced, record.copy_removed_at) == ("refused: non_space_consuming", "T")
+
+    def test_a_failure_leaves_the_record_open_for_the_next_run(self, tmp_path):
+        record = self._record()
+        self._journal(tmp_path).apply(record, _Outcome("failed", "trash failed: rpc=XwAOJf"), at="T")
+        assert record.replaced is None and record.replace_error == "trash failed: rpc=XwAOJf"
+
+    def test_a_later_success_clears_an_earlier_error(self, tmp_path):
+        record = self._record(replace_error="trash failed: rpc=XwAOJf")
+        self._journal(tmp_path).apply(record, _Outcome("replaced", "", "ORIG-1"), at="T")
+        assert record.replace_error is None
+
+    @pytest.mark.parametrize("status", sorted(UNCHANGED))
+    def test_a_pass_that_changed_nothing_writes_nothing(self, tmp_path, status):
+        record = self._record()
+        self._journal(tmp_path).apply(record, _Outcome(status, "would have"), at="T")
+        assert (record.replaced, record.replaced_at, record.replace_error) == (None, None, None)
+
+    def test_an_unknown_status_is_visible_rather_than_silently_misfiled(self, tmp_path):
+        record = self._record()
+        self._journal(tmp_path).apply(record, _Outcome("teleported", "?"), at="T")
+        assert record.replaced is None
+        assert record.replace_error == "unknown outcome: teleported"
+
+
+class TestEveryOutcomeIsKnownHere:
+    """The mapping used to live in the step modules, where a status added to
+    `replacement.py` simply never arrived. This fails instead."""
+
+    def test_every_status_replacement_can_produce_is_handled(self, tmp_path):
+        import ast
+
+        source = (Path(__file__).resolve().parents[1] / "src" / "photos_shrink" / "replacement.py").read_text(
+            encoding="utf-8"
+        )
+        produced = {
+            node.args[0].value
+            for node in ast.walk(ast.parse(source))
+            if isinstance(node, ast.Call)
+            and getattr(node.func, "id", None) == "Outcome"
+            and node.args
+            and isinstance(node.args[0], ast.Constant)
+        }
+        assert produced, "no Outcome literals found; the scan is broken, not the code"
+        journal = UploadJournal(tmp_path / "j.json")
+        for status in sorted(produced):
+            record = UploadRecord(output=Path("one.avif"), verified="ok")
+            journal.apply(record, _Outcome(status, "detail", "ORIG-1"), at="T")
+            assert record.replace_error != f"unknown outcome: {status}", (
+                f"replacement.py can produce {status!r} and ledger.apply does not know it"
+            )
