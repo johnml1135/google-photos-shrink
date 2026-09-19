@@ -602,6 +602,30 @@ class TestRemoveExtraCopies:
         assert remove(library, [job], tmp_path, apply=False)[job.key].status == "would_remove_copy"
         assert "trash_many" not in library.names()
 
+    def test_a_copy_that_is_already_gone_closes_the_record(self, tmp_path):
+        """It was trashed by a run whose confirmation failed, so nothing
+        recorded it. 465 records asked Google about it again every run."""
+
+        job = make_job(tmp_path)
+        library = library_for("one")
+        self.free(library, "one")  # refused, so its copy is an extra copy
+        library.by_output.pop(job.output.name)  # the hash lookup knows nothing of it
+        outcome = remove(library, [job], tmp_path)[job.key]
+        assert outcome.status == "copy_gone"
+        assert library.trashed() == []
+
+    def test_replacing_still_refuses_to_guess_at_a_missing_replacement(self, tmp_path):
+        """The same fact, the opposite verdict: an original is never trashed
+        on the strength of a replacement nobody can find."""
+
+        job = make_job(tmp_path)
+        library = library_for("one")
+        library.by_output.pop(job.output.name)
+        outcome = run(library, [job], tmp_path)[job.key]
+        assert outcome.status == "failed"
+        assert "not guessing" in outcome.detail
+        assert library.trashed() == []
+
     def test_an_original_that_vanished_leaves_its_copy_alone_and_closes(self, tmp_path):
         """No original means no extra copy: the upload is the only one left.
 
@@ -630,14 +654,6 @@ class TestRemoveExtraCopies:
         library = library_for("one")
         self.free(library, "one")
         library.items["ORIG-one"]["size_bytes"] = 999
-        assert remove(library, [job], tmp_path)[job.key].status == "failed"
-        assert library.trashed() == []
-
-    def test_a_copy_not_found_by_hash_is_not_guessed(self, tmp_path):
-        job = make_job(tmp_path)
-        library = library_for("one")
-        self.free(library, "one")
-        del library.by_output["one.avif"]
         assert remove(library, [job], tmp_path)[job.key].status == "failed"
         assert library.trashed() == []
 

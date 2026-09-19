@@ -99,9 +99,9 @@ class Outcome:
 
     # The whole vocabulary, both passes. Replacing says: replaced,
     # would_replace, verified_original_kept, refused, gone, failed. Removing a
-    # copy says: copy_removed, would_remove_copy, kept, gone, failed. What each
-    # one does to a journal record is decided in one place, `ledger.apply`,
-    # and `test_ledger.py` fails if a status here is missing from it.
+    # copy says: copy_removed, copy_gone, would_remove_copy, kept, gone,
+    # failed. What each one does to a journal record is decided in one place,
+    # `ledger.apply`, and `test_ledger.py` fails if a status here is missing.
     status: str
     detail: str
     original_media_key: str | None = None
@@ -236,6 +236,7 @@ class _Batch:
         self.originals: dict[str, dict[str, Any]] = {}
         self.refused: dict[str, str] = {}
         self.unreadable: dict[str, UploadRecord] = {}
+        self.missing: dict[str, UploadRecord] = {}
         self.matches: dict[str, dict[str, str]] = {}
         self._check_disk(jobs)
 
@@ -323,7 +324,12 @@ class _Batch:
         for key, job in list(self.live.items()):
             match = found.get(job.output)
             if match is None:
-                self.fail(job, "replacement not found by content hash; not guessing")
+                # The lookup answered and knows nothing of this file. What
+                # that means is the caller's to say: replacing must not guess
+                # at an original's replacement, while a copy that is not in
+                # the library is a copy with nothing left to remove.
+                self.missing[key] = job
+                self.live.pop(key, None)
             elif isinstance(match, Exception):
                 self.fail(job, f"replacement lookup failed: {match}")
             else:
@@ -392,6 +398,8 @@ def replace_batch(
 
     # 5: the replacements.
     batch.find_replacements()
+    for key, job in batch.missing.items():
+        batch.fail(job, "replacement not found by content hash; not guessing")
 
     # 5b: originals that could not be read, which is either a dead session or
     # an original that is no longer there -- trashed by an earlier run whose
@@ -510,6 +518,12 @@ def remove_extra_copies(
     batch.live.clear()
     batch.live.update({key: batch.jobs[key] for key in batch.refused})
     batch.find_replacements()
+    # A copy that is not in the library was already trashed -- by an earlier
+    # run of this step whose confirmation failed, so the journal never
+    # recorded it. 465 records were failing this way on every run, each one
+    # asking Google again about a photo that is not there.
+    for key, job in batch.missing.items():
+        batch.outcomes[key] = Outcome("copy_gone", "the copy is not in the library", job.media_key)
 
     if not apply:
         for key, job in batch.live.items():

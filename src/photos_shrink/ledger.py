@@ -273,6 +273,11 @@ class UploadJournal:
         if status == "failed":
             record.replace_error = detail
             return
+        if status == "copy_gone":
+            # Nothing was trashed now: the copy had already gone, so only the
+            # fact that there is none left to remove is recorded.
+            record.copy_removed_at = stamp
+            return
         if status == "copy_removed":
             record.replaced = f"{REFUSED}: {detail}"
             record.copy_removed_at = stamp
