@@ -18,6 +18,7 @@ import time
 from dataclasses import replace as _replace
 from pathlib import Path
 
+from photos_shrink.batching import run_batches, summarise
 from photos_shrink.config import load_config
 from photos_shrink.ledger import UploadJournal
 from photos_shrink.mirror_sizes import load_exported_sizes
@@ -35,7 +36,7 @@ def _load_mirror_keys(mirror_path: Path) -> dict[str, str]:
     return keys
 
 
-def main() -> int:
+def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Fix replacement metadata and trash replaced originals")
     parser.add_argument("--journal", type=Path, default=None, help="Defaults to <data_dir>/takeout-upload-journal.json")
     parser.add_argument("--mirror", type=Path, default=None)
@@ -48,7 +49,7 @@ def main() -> int:
         help="Fix and verify, never trash; the journal is not updated",
     )
     parser.add_argument("--pause", type=float, default=1.0, help="Seconds between batches")
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
 
     settings = load_config(args.config)
     if args.journal is None:
@@ -87,49 +88,28 @@ def main() -> int:
         for record in todo
     ]
 
-    counts: dict[str, int] = {}
     # One watch for the run: a dead session is many empty batches, at any size.
     watch = SessionWatch()
     started = time.monotonic()
     try:
         with open_session(settings) as remote:
             print(f"Account: {remote.account_id()}", flush=True)
-            for start in range(0, len(jobs), args.batch):
-                batch = jobs[start : start + args.batch]
-                label = f"[{start + 1}-{start + len(batch)}/{len(jobs)}]"
-                batch_started = time.monotonic()
-                try:
-                    outcomes = replace_batch(
-                        remote, batch, settings=settings, apply=args.apply,
-                        keep_originals=args.keep_originals, sizes=exported_sizes, watch=watch,
-                        progress=lambda message, label=label: print(f"{label} {message}", flush=True),
-                    )
-                except RemoteProtocolError as exc:
-                    # A request for the whole batch failed -- most often an
-                    # expired session. Nothing after the failure ran.
-                    print(f"{label} batch stopped: {exc}", flush=True)
-                    counts["failed"] = counts.get("failed", 0) + len(batch)
-                    break
-                for job in batch:
-                    outcome = outcomes[job.key]
-                    record = records[job.key]
-                    name = record.source.name if record.source else "?"
-                    counts[outcome.status] = counts.get(outcome.status, 0) + 1
-                    print(f"  {name}: {outcome.status.upper()} {outcome.detail}", flush=True)
-                    if args.apply:
-                        journal.apply(record, outcome)
-                if args.apply:
-                    journal.save()
-                print(f"{label} done in {time.monotonic() - batch_started:.1f}s", flush=True)
-                if args.pause and start + args.batch < len(jobs):
-                    time.sleep(args.pause)
+            counts = run_batches(
+                jobs, records=records, journal=journal, apply=args.apply,
+                size=args.batch, pause=args.pause,
+                report=lambda message: print(message, flush=True),
+                work=lambda batch, progress: replace_batch(
+                    remote, batch, settings=settings, apply=args.apply,
+                    keep_originals=args.keep_originals, sizes=exported_sizes, watch=watch,
+                    progress=progress,
+                ),
+            )
     except RemoteProtocolError as exc:
         print(f"\n{exc}", file=sys.stderr)
         print(COOKIE_HINT, file=sys.stderr)
         return 2
 
-    summary = ", ".join(f"{status} {count}" for status, count in sorted(counts.items()))
-    print(f"\n--- {summary} in {time.monotonic() - started:.1f}s ---", flush=True)
+    print(summarise(counts, time.monotonic() - started), flush=True)
     if args.apply:
         print(f"  journal: {args.journal}", flush=True)
         print("  Originals remain in the Takeout export on disk.", flush=True)

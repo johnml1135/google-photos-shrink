@@ -47,6 +47,7 @@ class FakeLibrary:
     trash_takes: bool = True
     trash_error: Exception | None = None
     bin_error: Exception | None = None
+    find_error: Exception | None = None
     bin: set[str] = field(default_factory=set)
     calls: list[tuple] = field(default_factory=list)
 
@@ -56,6 +57,8 @@ class FakeLibrary:
 
     def find_uploaded_many(self, paths):
         self.calls.append(("find_uploaded_many", [Path(p).name for p in paths]))
+        if self.find_error and paths:  # no paths, no request, nothing to fail
+            raise self.find_error
         result = {}
         for path in paths:
             found = self.by_output.get(Path(path).name)
@@ -189,11 +192,30 @@ class TestWholeBatch:
 
         names = [f"n{i}" for i in range(12)]
         jobs = [make_job(tmp_path, name, media_key=f"ORIG-{name}") for name in names]
-        library = library_for(*names)
+        library = library_for(*names, find_error=RemoteProtocolError("rpc=zy0IHe"))
         for name in names:
             library.items[f"ORIG-{name}"] = RemoteProtocolError("unsuccessful response rpc=VrseUb")
         with pytest.raises(RemoteProtocolError, match="the session is gone"):
             run(library, jobs, tmp_path)
+        assert library.trashed() == []
+
+    def test_a_whole_batch_of_vanished_originals_is_closed_not_read_as_a_dead_session(self, tmp_path):
+        """The case the queue was actually in, for hours.
+
+        Once a run trashed originals it could not confirm, the head of the
+        queue was nothing but records whose originals were gone. Reading
+        them fails exactly as a dead session does, so the guard stopped
+        every run at the same place and the records were never closed. The
+        hash lookup answering is what tells the two apart.
+        """
+
+        names = [f"n{i}" for i in range(12)]
+        jobs = [make_job(tmp_path, name, media_key=f"ORIG-{name}") for name in names]
+        library = library_for(*names)
+        for name in names:
+            library.items[f"ORIG-{name}"] = RemoteProtocolError("unsuccessful response rpc=VrseUb")
+        outcomes = run(library, jobs, tmp_path)
+        assert {o.status for o in outcomes.values()} == {"gone"}
         assert library.trashed() == []
 
     def test_an_original_that_is_no_longer_there_is_closed_not_retried(self, tmp_path):
@@ -221,16 +243,6 @@ class TestWholeBatch:
         library.items["ORIG-n0"] = RemoteProtocolError("unsuccessful response rpc=VrseUb")
         library.by_output.pop(jobs[0].output.name)
         assert run(library, jobs, tmp_path)[jobs[0].key].status == "failed"
-
-    def test_a_batch_that_reads_nothing_stops_the_run(self, tmp_path):
-        names = [f"n{i}" for i in range(12)]
-        jobs = [make_job(tmp_path, name, media_key=f"ORIG-{name}") for name in names]
-        library = library_for(*names)
-        for name in names:
-            library.items[f"ORIG-{name}"] = RemoteProtocolError("unsuccessful response rpc=VrseUb")
-        with pytest.raises(RemoteProtocolError, match="the session is gone"):
-            run(library, jobs, tmp_path)
-        assert library.trashed() == []
 
     def test_one_failure_does_not_stop_the_rest(self, tmp_path):
         good = make_job(tmp_path, "good", media_key="ORIG-good")
@@ -277,7 +289,7 @@ class TestOriginal:
         outcomes = run(library, [job], tmp_path)
         assert outcomes[job.key].status == "failed"
         assert "may describe a different file" in outcomes[job.key].detail
-        assert library.calls[1] == ("find_uploaded_many", [])
+        assert "find_uploaded_many" not in library.names()  # nothing was looked up
         assert library.trashed() == []
 
     def test_another_id_fails(self, tmp_path):
@@ -287,11 +299,19 @@ class TestOriginal:
         assert run(library, [job], tmp_path)[job.key].status == "failed"
         assert library.trashed() == []
 
-    def test_a_lone_unreadable_original_is_never_judged_gone(self, tmp_path):
-        """One job is no evidence about the session, so nothing is concluded."""
+    def test_an_unreadable_original_is_judged_by_what_else_answers(self, tmp_path):
+        """The lookup answering is the evidence, not how many jobs there are."""
 
         job = make_job(tmp_path)
         library = library_for("one")
+        library.items["ORIG-one"] = RemoteProtocolError("item identity is incomplete")
+        outcome = run(library, [job], tmp_path)[job.key]
+        assert outcome.status == "gone"
+        assert library.trashed() == []
+
+    def test_nothing_is_concluded_when_nothing_answers(self, tmp_path):
+        job = make_job(tmp_path)
+        library = library_for("one", find_error=RemoteProtocolError("rpc=zy0IHe"))
         library.items["ORIG-one"] = RemoteProtocolError("item identity is incomplete")
         outcome = run(library, [job], tmp_path)[job.key]
         assert outcome.status == "failed"
@@ -573,7 +593,7 @@ class TestRemoveExtraCopies:
         outcome = remove(library, [job], tmp_path)[job.key]
         assert outcome.status == "kept"
         assert "trash_many" not in library.names()
-        assert ("find_uploaded_many", []) in library.calls
+        assert "find_uploaded_many" not in library.names()  # no replacement was looked up
 
     def test_dry_run_trashes_nothing(self, tmp_path):
         job = make_job(tmp_path)
@@ -582,9 +602,23 @@ class TestRemoveExtraCopies:
         assert remove(library, [job], tmp_path, apply=False)[job.key].status == "would_remove_copy"
         assert "trash_many" not in library.names()
 
-    def test_an_unreadable_original_keeps_its_copy(self, tmp_path):
+    def test_an_original_that_vanished_leaves_its_copy_alone_and_closes(self, tmp_path):
+        """No original means no extra copy: the upload is the only one left.
+
+        It used to come back as failed, so this path retried the same records
+        on every run, exactly as the replace path did before it learned to
+        close them.
+        """
+
         job = make_job(tmp_path)
         library = library_for("one")
+        library.items["ORIG-one"] = RemoteProtocolError("rpc=VrseUb")
+        assert remove(library, [job], tmp_path)[job.key].status == "gone"
+        assert library.trashed() == []
+
+    def test_an_unreadable_original_keeps_its_copy_when_nothing_answers(self, tmp_path):
+        job = make_job(tmp_path)
+        library = library_for("one", find_error=RemoteProtocolError("rpc=zy0IHe"))
         library.items["ORIG-one"] = RemoteProtocolError("rpc=VrseUb")
         assert remove(library, [job], tmp_path)[job.key].status == "failed"
         assert library.trashed() == []
@@ -681,38 +715,49 @@ class TestAnEditedOriginal:
 class TestSessionWatch:
     """Telling a dead session from a photo that is no longer there."""
 
-    def test_a_batch_that_reads_nothing_stops_the_run(self):
+    def test_reads_failing_wholesale_stops_the_run(self):
         watch = SessionWatch()
+        watch.note(asked=100, read=0)
         with pytest.raises(RemoteProtocolError, match="the session is gone"):
-            watch.note(asked=100, read=0)
+            watch.check()
 
     def test_small_batches_still_reach_the_floor(self):
         """As a per-batch test, `--batch 5` never reached it and ran unguarded."""
 
         watch = SessionWatch()
         watch.note(asked=5, read=0)
+        watch.check()
+        watch.note(asked=5, read=0)
         with pytest.raises(RemoteProtocolError, match="10 originals in a row"):
-            watch.note(asked=5, read=0)
+            watch.check()
 
     def test_one_read_getting_through_clears_the_streak(self):
         watch = SessionWatch()
         watch.note(asked=9, read=0)
         watch.note(asked=9, read=1)
-        assert watch.healthy
-        watch.note(asked=9, read=0)  # the streak restarts rather than tipping over
+        watch.note(asked=9, read=0)
+        watch.check()
+
+    def test_a_request_that_answers_clears_the_streak(self):
+        """A hash lookup answering proves the session, whatever the reads did."""
+
+        watch = SessionWatch()
+        watch.note(asked=100, read=0)
+        watch.alive()
+        watch.check()
 
     def test_a_few_missing_photos_never_stop_a_working_session(self):
         watch = SessionWatch()
         for _ in range(50):
             watch.note(asked=100, read=97)
-        assert watch.healthy
+        watch.check()
 
-    def test_a_run_of_single_item_batches_is_still_judged(self, tmp_path):
+    def test_a_run_of_single_item_batches_is_still_judged(self):
         watch = SessionWatch()
-        for _ in range(9):
+        for _ in range(10):
             watch.note(asked=1, read=0)
         with pytest.raises(RemoteProtocolError):
-            watch.note(asked=1, read=0)
+            watch.check()
 
     def test_the_watch_carries_across_batches_of_jobs(self, tmp_path):
         """Two half-batches of a dead session add up to one stopped run."""
@@ -720,7 +765,7 @@ class TestSessionWatch:
         watch = SessionWatch()
         names = [f"n{i}" for i in range(12)]
         jobs = [make_job(tmp_path, name, media_key=f"ORIG-{name}") for name in names]
-        library = library_for(*names)
+        library = library_for(*names, find_error=RemoteProtocolError("rpc=zy0IHe"))
         for name in names:
             library.items[f"ORIG-{name}"] = RemoteProtocolError("unsuccessful response rpc=VrseUb")
         run(library, jobs[:6], tmp_path, watch=watch)  # 6 unread: under the floor, no verdict

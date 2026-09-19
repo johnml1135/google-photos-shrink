@@ -130,7 +130,7 @@ def format_duration(seconds: float) -> str:
     return f"{seconds / 3600:.1f}h"
 
 
-def main() -> int:
+def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Encode a Takeout export, resumably")
     parser.add_argument("root", type=Path, help="Extracted Takeout root")
     parser.add_argument("--limit", type=int, default=0, help="0 encodes everything")
@@ -148,7 +148,7 @@ def main() -> int:
         "--workers", type=int, default=0,
         help="Encodes to run at once (default: run.encode_workers)",
     )
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
 
     config = load_config(args.config)
     settings = config.as_dict()

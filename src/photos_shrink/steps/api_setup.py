@@ -26,12 +26,12 @@ from photos_shrink.photos_api import (
 )
 
 
-def main() -> int:
+def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Authorize the Google Photos API")
     parser.add_argument("--config", default="shrink.toml")
     parser.add_argument("--check", action="store_true", help="Verify the stored token only")
     parser.add_argument("--no-browser", action="store_true", help="Print the URL, do not open it")
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
 
     settings = load_config(args.config)
     work_dir = Path(settings.run["work_dir"])

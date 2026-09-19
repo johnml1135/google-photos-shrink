@@ -92,7 +92,7 @@ def sample(
     return chosen[:count]
 
 
-def main() -> int:
+def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Read-only Takeout/library match probe")
     parser.add_argument("root", type=Path, help="Extracted Takeout root (the folder holding 'Google Photos')")
     parser.add_argument("--sample", type=int, default=25, help="Files to hash-match against the library")
@@ -105,7 +105,7 @@ def main() -> int:
         help="Draw evenly from each category instead of uniformly. Probes odd "
         "categories deliberately; the resulting rate is NOT the library's rate.",
     )
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
 
     print(f"Scanning {args.root} ...", flush=True)
     records = inventory(args.root)

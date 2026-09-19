@@ -2,7 +2,7 @@
 
 A replacement whose original is refused -- it costs no quota, was shared in by
 someone else, or is otherwise left alone -- is only an extra copy on this
-account's storage. This asks the same gate as `takeout_replace.py` of every
+account's storage. This asks the same gate as the replace step of every
 upload not yet replaced, and trashes the replacement of each refused original,
 confirmed in the bin. No original is touched. The safety logic lives in
 `photos_shrink.replacement.remove_extra_copies`.
@@ -17,6 +17,7 @@ import sys
 import time
 from pathlib import Path
 
+from photos_shrink.batching import run_batches, summarise
 from photos_shrink.config import load_config
 from photos_shrink.ledger import UploadJournal
 from photos_shrink.mirror_sizes import load_exported_sizes
@@ -24,7 +25,7 @@ from photos_shrink.remote import COOKIE_HINT, RemoteProtocolError, open_session
 from photos_shrink.replacement import SessionWatch, remove_extra_copies
 
 
-def main() -> int:
+def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Trash replacements whose originals are refused")
     parser.add_argument("--journal", type=Path, default=None, help="Defaults to <data_dir>/takeout-upload-journal.json")
     parser.add_argument("--config", default="shrink.toml")
@@ -32,7 +33,7 @@ def main() -> int:
     parser.add_argument("--batch", type=int, default=100, help="Items per batch (default 100)")
     parser.add_argument("--apply", action="store_true", help="Actually trash the extra copies")
     parser.add_argument("--pause", type=float, default=1.0, help="Seconds between batches")
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
 
     settings = load_config(args.config)
     if args.journal is None:
@@ -56,44 +57,28 @@ def main() -> int:
     if not args.apply:
         print("\nDRY RUN -- nothing will be changed. Re-run with --apply.\n", flush=True)
 
-    counts: dict[str, int] = {}
     # One watch for the run: a dead session is many empty batches, at any size.
     watch = SessionWatch()
     started = time.monotonic()
     try:
         with open_session(settings) as remote:
             print(f"Account: {remote.account_id()}", flush=True)
-            for start in range(0, len(todo), args.batch):
-                batch = todo[start : start + args.batch]
-                label = f"[{start + 1}-{start + len(batch)}/{len(todo)}]"
-                try:
-                    outcomes = remove_extra_copies(
-                        remote, batch, settings=settings, apply=args.apply, sizes=exported_sizes, watch=watch,
-                        progress=lambda message, label=label: print(f"{label} {message}", flush=True),
-                    )
-                except RemoteProtocolError as exc:
-                    print(f"{label} batch stopped: {exc}", flush=True)
-                    counts["failed"] = counts.get("failed", 0) + len(batch)
-                    break
-                for record in batch:
-                    outcome = outcomes[record.key]
-                    counts[outcome.status] = counts.get(outcome.status, 0) + 1
-                    if outcome.status != "kept":
-                        name = record.source.name if record.source else "?"
-                        print(f"  {name}: {outcome.status.upper()} {outcome.detail}", flush=True)
-                    if args.apply:
-                        journal.apply(record, outcome)
-                if args.apply:
-                    journal.save()
-                if args.pause and start + args.batch < len(todo):
-                    time.sleep(args.pause)
+            counts = run_batches(
+                todo, records={record.key: record for record in todo}, journal=journal,
+                apply=args.apply, size=args.batch, pause=args.pause,
+                report=lambda message: print(message, flush=True),
+                announce=lambda status: status != "kept",
+                work=lambda batch, progress: remove_extra_copies(
+                    remote, batch, settings=settings, apply=args.apply,
+                    sizes=exported_sizes, watch=watch, progress=progress,
+                ),
+            )
     except RemoteProtocolError as exc:
         print(f"\n{exc}", file=sys.stderr)
         print(COOKIE_HINT, file=sys.stderr)
         return 2
 
-    summary = ", ".join(f"{status} {count}" for status, count in sorted(counts.items()))
-    print(f"\n--- {summary} in {time.monotonic() - started:.1f}s ---", flush=True)
+    print(summarise(counts, time.monotonic() - started), flush=True)
     return 1 if counts.get("failed") else 0
 
 

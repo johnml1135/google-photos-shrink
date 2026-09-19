@@ -1,10 +1,11 @@
 """Every `photos_shrink` name a tool reaches for must still exist.
 
-The tools are scripts: nothing imports them, most of their main() has no test,
-and ruff cannot tell that `takeout.sha256` names a function that is gone. So a
-dead-code pass removed `takeout.sha256` while the upload step still
-called it -- `--help` worked, every test passed, and the first real upload
-would have died with an AttributeError.
+A step is imported now, by `cli.py`, but importing it only runs its module
+body: most of a step's main() still has no test, and ruff cannot tell that
+`takeout.sha256` names a function that is gone. So a dead-code pass removed
+`takeout.sha256` while the upload step still called it -- `--help` worked,
+every test passed, and the first real upload would have died with an
+AttributeError.
 
 This walks each tool's source for attribute access on an imported
 `photos_shrink` module and for names imported from one, and checks each

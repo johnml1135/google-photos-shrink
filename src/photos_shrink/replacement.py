@@ -62,22 +62,31 @@ class SessionWatch:
         self.unread = 0
 
     def note(self, *, asked: int, read: int) -> None:
-        """Record one batch's reads. Raises once the session looks gone."""
+        """Record one batch's reads. No verdict yet: see `check`."""
 
-        if read:
-            self.unread = 0
-            return
-        self.unread += asked
+        self.unread = 0 if read else self.unread + asked
+
+    def alive(self) -> None:
+        """Proof the session works, from a request that answered.
+
+        Reading an original that is no longer in the library fails exactly
+        like reading one through a dead session, so reads alone cannot tell
+        the two apart. A hash lookup that answers can: it went to the same
+        session and came back. Without this, a batch that was entirely
+        vanished originals -- which is how the queue looked for hours after
+        one run trashed originals it could not confirm -- read as a dead
+        session and stopped every run at the same place.
+        """
+
+        self.unread = 0
+
+    def check(self) -> None:
+        """Stop the run once nothing has answered for a whole floor's worth."""
+
         if self.unread >= self.floor:
             raise RemoteProtocolError(
                 f"{self.unread} originals in a row could not be read; the session is gone"
             )
-
-    @property
-    def healthy(self) -> bool:
-        """Whether reads are getting through, so failures can be judged."""
-
-        return self.unread == 0
 
 
 class ReplaceError(RuntimeError):
@@ -88,7 +97,12 @@ class ReplaceError(RuntimeError):
 class Outcome:
     """What happened, or would happen, to one job."""
 
-    status: str  # "replaced" | "would_replace" | "verified_original_kept" | "refused" | "gone" | "failed"
+    # The whole vocabulary, both passes. Replacing says: replaced,
+    # would_replace, verified_original_kept, refused, gone, failed. Removing a
+    # copy says: copy_removed, would_remove_copy, kept, gone, failed. What each
+    # one does to a journal record is decided in one place, `ledger.apply`,
+    # and `test_ledger.py` fails if a status here is missing from it.
+    status: str
     detail: str
     original_media_key: str | None = None
 
@@ -273,14 +287,37 @@ class _Batch:
                 self.refused[job.key] = blocked
                 self.live.pop(job.key)
 
-        # Reads failing wholesale is the session, not the photos: an expired
-        # cookie once answered 2,803 reads in a row with the same error while
-        # the run charged on through them.
+        # Counted, not judged: an original that is no longer there reads
+        # exactly like a dead session, and only a later request can tell
+        # them apart. `check` gives the verdict once it has.
         self.watch.note(asked=asked, read=len(self.live) + len(self.refused))
+
+    def judge_unreadable(self) -> None:
+        """Close the unreadable originals the session can vouch for."""
+
+        if not self.unreadable:
+            self.watch.check()
+            return
+        self.progress(f"{len(self.unreadable)} unreadable original(s)")
+        try:
+            found = self.library.find_uploaded_many([job.output for job in self.unreadable.values()])
+        except RemoteProtocolError:
+            found = {}
+        else:
+            self.watch.alive()
+        for key, job in self.unreadable.items():
+            match = found.get(job.output)
+            if match and not isinstance(match, Exception):
+                self.outcomes[key] = Outcome("gone", "original is no longer in the library", job.media_key)
+            else:
+                self.outcomes[key] = Outcome("failed", "original could not be read", job.media_key)
+        self.watch.check()
 
     def find_replacements(self) -> None:
         """Resolve each live job's replacement by the content hash of what was uploaded."""
 
+        if not self.live:
+            return
         self.progress(f"finding {len(self.live)} replacement(s)")
         found = self.library.find_uploaded_many([job.output for job in self.live.values()])
         for key, job in list(self.live.items()):
@@ -356,22 +393,14 @@ def replace_batch(
     # 5: the replacements.
     batch.find_replacements()
 
-    # 5b: originals that could not be read. The rest of the batch reading
-    # fine is the proof that the session works, so these are originals that
-    # are no longer in the library -- trashed by an earlier run whose confirm
-    # step failed, then emptied from the bin. Closing them destroys nothing:
-    # the replacement is confirmed present first, and a queue that keeps
-    # retrying them stalls on the same hundred items every run.
-    if batch.unreadable:
-        healthy = batch.watch.healthy
-        batch.progress(f"{len(batch.unreadable)} unreadable original(s)")
-        gone = library.find_uploaded_many([job.output for job in batch.unreadable.values()]) if healthy else {}
-        for key, job in batch.unreadable.items():
-            match = gone.get(job.output)
-            if match and not isinstance(match, Exception):
-                batch.outcomes[key] = Outcome("gone", "original is no longer in the library", job.media_key)
-            else:
-                batch.outcomes[key] = Outcome("failed", "original could not be read", job.media_key)
+    # 5b: originals that could not be read, which is either a dead session or
+    # an original that is no longer there -- trashed by an earlier run whose
+    # confirm step failed, then emptied from the bin. The hash lookup settles
+    # it: an answer proves the session, so those reads failed on their own
+    # account and the record can be closed. Closing destroys nothing -- the
+    # replacement is confirmed present first -- and a queue that keeps
+    # retrying them stalls every run on the same hundred items.
+    batch.judge_unreadable()
 
     def read_replacements(keys: list[str]) -> dict[str, dict[str, Any]]:
         found = library.get_items([batch.matches[key]["id"] for key in keys])
@@ -470,10 +499,11 @@ def remove_extra_copies(
 
     batch = _Batch(library, jobs, settings, progress, sizes, watch)
     batch.read_originals()
-    for key, job in batch.unreadable.items():
-        # Removing a copy turns on the original being refused, which an
-        # unreadable original cannot show. Nothing is trashed on a guess.
-        batch.outcomes[key] = Outcome("failed", "original could not be read", job.media_key)
+    # An original that is gone has no copy to remove: its replacement is the
+    # only one left. Judged the same way as when replacing, so this path stops
+    # retrying those records forever too. Nothing is trashed on a guess: a job
+    # whose original merely failed to read stays failed.
+    batch.judge_unreadable()
     for key, job in batch.live.items():
         batch.outcomes[key] = Outcome("kept", "the original is not refused", job.media_key)
     # From here on the jobs in play are the refused ones.

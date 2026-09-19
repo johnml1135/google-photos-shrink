@@ -26,13 +26,14 @@ from typing import Any
 
 # What `replaced` may hold, and which of those values settle a record. A
 # settled record has nothing left to trash: the original is gone, by this
-# tool's hand or someone else's. A refused or duplicate upload is the other
-# case -- the original stays, so the copy this tool made is an extra copy
-# until `copy_removed_at` says otherwise.
+# tool's hand or someone else's. Every other value leaves the original in
+# the library -- `refused: <token>` because a gate said to keep it,
+# `duplicate: ...` because another record replaced the same library item --
+# so the copy this tool uploaded is an extra copy until `copy_removed_at`
+# says it was cleared.
 REPLACED = "replaced"
 GONE = "gone"
 REFUSED = "refused"
-DUPLICATE = "duplicate"
 SETTLED = (REPLACED, GONE)
 
 # Outcomes that describe a pass which changed nothing: a dry run, or a check
@@ -45,7 +46,7 @@ def settled(replaced: str | None) -> bool:
 
     if not replaced:
         return False
-    return replaced == REPLACED or replaced.split(":", 1)[0] in SETTLED
+    return replaced.split(":", 1)[0] in SETTLED
 
 # Written together, unconditionally, every time the uploader records a new
 # entry (see photos_shrink/steps/upload.py). Always present in a fresh record,

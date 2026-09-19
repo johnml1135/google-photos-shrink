@@ -17,7 +17,7 @@ from collections.abc import Callable
 
 from .steps import api_setup, encode, mirror, probe, remove_copies, replace, upload
 
-STEPS: dict[str, tuple[Callable[[], int], str]] = {
+STEPS: dict[str, tuple[Callable[[list[str]], int], str]] = {
     "probe": (probe.main, "Read the export and report what it holds"),
     "mirror": (mirror.main, "Join the export to the live library, item by item"),
     "encode": (encode.main, "Encode the export into replacements, offline"),
@@ -39,11 +39,12 @@ def usage() -> None:
 def main() -> int:
     # Dispatched by hand rather than with subparsers: each step owns a full
     # parser of its own, and a shared one here would answer `replace --help`
-    # with this help instead of the step's.
+    # with this help instead of the step's. The step is handed its arguments
+    # rather than left to read a rewritten sys.argv, so a test can call one.
     argv = sys.argv[1:]
     if argv and argv[0] in STEPS:
-        sys.argv = [f"photos-shrink {argv[0]}", *argv[1:]]
-        return STEPS[argv[0]][0]()
+        sys.argv[0] = f"photos-shrink {argv[0]}"  # what --help calls itself
+        return STEPS[argv[0]][0](argv[1:])
     usage()
     if not argv or argv[0] in ("-h", "--help"):
         return 0

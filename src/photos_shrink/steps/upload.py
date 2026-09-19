@@ -71,7 +71,7 @@ def verify_item(item: dict, source: Path, ffprobe: str) -> tuple[str, str]:
     return "ok", str(metadata.get("creationTime"))
 
 
-def main() -> int:
+def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Upload encoded replacements via the Photos API")
     parser.add_argument("--report", type=Path, default=None, help="Defaults to <data_dir>/encoded.csv")
     parser.add_argument("--config", default="shrink.toml")
@@ -86,7 +86,7 @@ def main() -> int:
         action="store_true",
         help="Re-check already uploaded items against the API. Uploads nothing.",
     )
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
 
     settings = load_config(args.config)
     work_dir = Path(settings.run["work_dir"])
@@ -173,28 +173,32 @@ def main() -> int:
         wanted = {row["output"] for row in rows}
         scoped = [r for r in journal.all_records() if str(r.output) in wanted]
         print(f"re-checking {len(scoped)} of {len(journal)} uploaded item(s)", flush=True)
-        for index, record in enumerate(scoped, 1):
-            try:
-                stored = api.get_media_item(record.media_item_id)
-            except PhotosApiError as exc:
-                # An API failure says nothing about the item, so the verdict
-                # already recorded stands. Overwriting it with "unverified"
-                # would strand a verified upload: only verified uploads are
-                # allowed to replace their original.
-                print(f"  {record.output.name}: not checked  {exc}", flush=True)
-                if exc.status == 429:
-                    print("  Quota is gone for the day; stopping.", file=sys.stderr)
-                    break
-                continue
-            verdict, detail = verify_item(stored, record.output, ffprobe)
-            record.verified, record.verified_detail = verdict, detail
-            record.capture_time = (stored.get("mediaMetadata") or {}).get("creationTime")
-            print(f"  {record.output.name}: {verdict}  {detail}", flush=True)
-            # Save as it goes: a pass that is interrupted keeps what it checked
-            # rather than spending the quota a second time.
-            if index % 50 == 0:
-                journal.save()
-        journal.save()
+        try:
+            for index, record in enumerate(scoped, 1):
+                try:
+                    stored = api.get_media_item(record.media_item_id)
+                except PhotosApiError as exc:
+                    # An API failure says nothing about the item, so the verdict
+                    # already recorded stands. Overwriting it with "unverified"
+                    # would strand a verified upload: only verified uploads are
+                    # allowed to replace their original.
+                    print(f"  {record.output.name}: not checked  {exc}", flush=True)
+                    if exc.status == 429:
+                        print("  Quota is gone for the day; stopping.", file=sys.stderr)
+                        break
+                    continue
+                verdict, detail = verify_item(stored, record.output, ffprobe)
+                record.verified, record.verified_detail = verdict, detail
+                record.capture_time = (stored.get("mediaMetadata") or {}).get("creationTime")
+                print(f"  {record.output.name}: {verdict}  {detail}", flush=True)
+                # Save as it goes: a pass that is interrupted keeps what it checked
+                # rather than spending the quota a second time.
+                if index % 50 == 0:
+                    journal.save()
+        finally:
+            # Whatever ended the pass -- the quota, a keyboard, an error
+            # nobody modelled -- what it checked is already paid for.
+            journal.save()
         ok = sum(1 for r in scoped if r.verified == "ok")
         print(f"\n  verified {ok}/{len(scoped)}; nothing was uploaded.", flush=True)
         return 0
