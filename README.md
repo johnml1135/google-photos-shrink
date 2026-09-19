@@ -93,6 +93,29 @@ cost you something. Expect a large share of a real library to be refused.
 Anything refused keeps its original, which leaves the uploaded copy as an extra
 copy on your storage: `remove-copies` trashes those.
 
+## Why you may still see two of something
+
+A library can hold the same recording twice, under two media keys, with capture
+times a whole number of hours apart -- one timezone reading each -- and slightly
+different bytes. Google charges for one of the pair and not the other, so this
+tool replaces the one that costs you and refuses the free one, and you are left
+looking at the free original beside a replacement of its twin. That is working
+as intended, but it looks like a duplicate. To find them, group your `mirror.csv`
+by filename and compare capture times: a whole-hour gap with identical minutes
+and seconds is a twin, not two takes.
+
+Deciding which of a pair to keep is yours to make, not this tool's: it never
+trashes an original it was not asked to replace.
+
+## What Takeout changes on the way out
+
+Takeout rebuilds a video's container on export, so the file on disk is a few
+kilobytes off what Google stores -- measured here at 4-17 KB, at most 0.07%.
+Because sizes are how an original is identified, a video is accepted only when
+its **dimensions match, its duration matches within a second, and its size is
+within 1%**. Photos get no such latitude: two photos in this library differ by
+108 bytes and are different images, so nothing is ever accepted on size alone.
+
 ## Files and recovery
 
 The work directory holds the cookie export, the API token and client, the upload
