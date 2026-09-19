@@ -788,3 +788,71 @@ class TestSessionWatch:
         with pytest.raises(RemoteProtocolError, match="the session is gone"):
             run(library, jobs[6:], tmp_path, watch=watch)  # 12 in a row: gone
         assert library.trashed() == []
+
+
+class TestARemuxedVideo:
+    """Takeout rebuilds a video's container, so the export is a few KB off.
+
+    Measured on this library: 12 of 12 videos differed by 4-17 KB while their
+    dimensions matched exactly and their durations were within 0.03s. 59
+    videos were refused for it, leaving both copies of each in the library.
+    """
+
+    def video(self, **overrides):
+        item = {"id": "ORIG-v", "kind": "video", "size_bytes": 25_504_607,
+                "width": 1920, "height": 1080, "duration_seconds": 31.5, "filename": "clip.mov"}
+        item.update(overrides)
+        return item
+
+    def job(self, tmp_path, size=25_487_918):
+        source = tmp_path / "clip.MOV"
+        source.write_bytes(b"x" * size)
+        return UploadRecord(source=source, output=tmp_path / "clip.mp4", media_key="ORIG-v")
+
+    def probe_of(self, **overrides):
+        local = {"kind": "video", "width": 1920, "height": 1080, "duration_seconds": 31.5}
+        local.update(overrides)
+        return lambda source: local
+
+    def test_it_is_accepted_when_dimensions_and_duration_agree(self, tmp_path):
+        check_original(self.video(), self.job(tmp_path), None, self.probe_of())
+
+    def test_a_rotated_video_reports_its_dimensions_the_other_way_round(self, tmp_path):
+        check_original(self.video(width=1080, height=1920), self.job(tmp_path), None, self.probe_of())
+
+    def test_a_different_duration_is_refused(self, tmp_path):
+        with pytest.raises(ReplaceError, match="may describe a different file"):
+            check_original(self.video(), self.job(tmp_path), None, self.probe_of(duration_seconds=44.0))
+
+    def test_different_dimensions_are_refused(self, tmp_path):
+        with pytest.raises(ReplaceError):
+            check_original(self.video(), self.job(tmp_path), None, self.probe_of(width=1280, height=720))
+
+    def test_a_size_nowhere_near_is_refused_however_well_it_corroborates(self, tmp_path):
+        """One of the 59 was 88% adrift: a genuinely different file."""
+
+        with pytest.raises(ReplaceError):
+            check_original(self.video(size_bytes=2_300_000), self.job(tmp_path), None, self.probe_of())
+
+    def test_a_photo_is_never_accepted_this_way(self, tmp_path):
+        """IMG_1493.JPG and IMG_1493(1).JPG are different photos 108 bytes
+        apart. A tolerance loose enough for the videos would trash the wrong
+        one of that pair, so photos are not offered this route at all."""
+
+        source = tmp_path / "IMG_1493.JPG"
+        source.write_bytes(b"x" * 1_564_988)
+        job = UploadRecord(source=source, output=tmp_path / "a.avif", media_key="ORIG-p")
+        item = {"id": "ORIG-p", "kind": "photo", "size_bytes": 1_564_880, "filename": "IMG_1493.JPG"}
+        with pytest.raises(ReplaceError, match="may describe a different file"):
+            check_original(item, job, None, self.probe_of(kind="photo"))
+
+    def test_an_unreadable_export_proves_nothing(self, tmp_path):
+        def explode(source):
+            raise OSError("ffprobe died")
+
+        with pytest.raises(ReplaceError):
+            check_original(self.video(), self.job(tmp_path), None, explode)
+
+    def test_without_a_probe_nothing_changes(self, tmp_path):
+        with pytest.raises(ReplaceError):
+            check_original(self.video(), self.job(tmp_path), None, None)

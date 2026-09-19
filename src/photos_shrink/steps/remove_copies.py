@@ -17,6 +17,7 @@ import sys
 import time
 from pathlib import Path
 
+from photos_shrink import media
 from photos_shrink.batching import run_batches, summarise
 from photos_shrink.config import load_config
 from photos_shrink.ledger import UploadJournal
@@ -70,7 +71,8 @@ def main(argv: list[str] | None = None) -> int:
                 announce=lambda status: status != "kept",
                 work=lambda batch, progress: remove_extra_copies(
                     remote, batch, settings=settings, apply=args.apply,
-                    sizes=exported_sizes, watch=watch, progress=progress,
+                    sizes=exported_sizes, watch=watch,
+                    probe=lambda source: media.probe(source, settings.tools["ffprobe"]), progress=progress,
                 ),
             )
     except RemoteProtocolError as exc:

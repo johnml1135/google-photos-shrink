@@ -18,6 +18,7 @@ import time
 from dataclasses import replace as _replace
 from pathlib import Path
 
+from photos_shrink import media
 from photos_shrink.batching import run_batches, summarise
 from photos_shrink.config import load_config
 from photos_shrink.ledger import UploadJournal
@@ -101,6 +102,7 @@ def main(argv: list[str] | None = None) -> int:
                 work=lambda batch, progress: replace_batch(
                     remote, batch, settings=settings, apply=args.apply,
                     keep_originals=args.keep_originals, sizes=exported_sizes, watch=watch,
+                    probe=lambda source: media.probe(source, settings.tools["ffprobe"]),
                     progress=progress,
                 ),
             )

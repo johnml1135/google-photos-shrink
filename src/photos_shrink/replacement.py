@@ -122,7 +122,47 @@ def _same_name(library_name: Any, exported: Path) -> bool:
     return library_name.casefold() == f"{stem}{suffix}".casefold()
 
 
-def check_original(item: dict[str, Any], job: UploadRecord, sizes: set[int] | None = None) -> None:
+# What a re-muxed video may differ by. Takeout rebuilds a video's container on
+# export, so the file on disk is a few kilobytes off what Google stores while
+# being the same recording: measured across 12 of this library's videos, gaps
+# of 4-17 KB (at most 0.07%) with identical dimensions and durations within
+# 0.03s. Size alone is never enough to accept on -- IMG_1493.JPG and
+# IMG_1493(1).JPG are different photos 108 bytes apart, and a tolerance that
+# admitted the videos would admit the wrong one of that pair -- so this only
+# ever applies to a video whose dimensions and duration also agree.
+VIDEO_SIZE_TOLERANCE = 0.01
+VIDEO_DURATION_TOLERANCE_SECONDS = 1.0
+
+
+def _same_recording(item: dict[str, Any], source: Path, probe: Callable[[Path], dict] | None) -> bool:
+    """Whether a library video and an exported file are the same recording."""
+
+    if probe is None or item.get("kind") != "video":
+        return False
+    reported = item.get("size_bytes") or 0
+    if not reported or abs(reported - source.stat().st_size) > reported * VIDEO_SIZE_TOLERANCE:
+        return False
+    try:
+        local = probe(source)
+    except Exception:  # noqa: BLE001 - an unreadable export proves nothing either way
+        return False
+    if local.get("kind") != "video":
+        return False
+    # As a set: a rotated video reports its dimensions the other way round.
+    if {item.get("width"), item.get("height")} != {local.get("width"), local.get("height")}:
+        return False
+    stored, exported = item.get("duration_seconds"), local.get("duration_seconds")
+    if stored is None or exported is None:
+        return False
+    return abs(stored - exported) <= VIDEO_DURATION_TOLERANCE_SECONDS
+
+
+def check_original(
+    item: dict[str, Any],
+    job: UploadRecord,
+    sizes: set[int] | None = None,
+    probe: Callable[[Path], dict] | None = None,
+) -> None:
     """Accept the sidecar's media key only when the item it names matches the export.
 
     The exported file's own size is the plain case. `sizes` holds every
@@ -145,6 +185,8 @@ def check_original(item: dict[str, Any], job: UploadRecord, sizes: set[int] | No
     if reported == exported:
         return
     if reported in (sizes or set()) and _same_name(item.get("filename"), job.source):
+        return
+    if _same_recording(item, job.source, probe):
         return
     raise ReplaceError(
         f"library item is {reported} bytes but the exported original is "
@@ -226,8 +268,9 @@ class _Batch:
 
     def __init__(self, library: Any, jobs: list[UploadRecord], settings: Settings,
                  progress: Callable[[str], None], sizes: dict[str, set[int]] | None = None,
-                 watch: SessionWatch | None = None):
+                 watch: SessionWatch | None = None, probe: Callable[[Path], dict] | None = None):
         self.library, self.settings, self.progress = library, settings, progress
+        self.probe = probe
         self.watch = watch or SessionWatch()
         self.sizes = sizes or {}
         self.jobs = {job.key: job for job in jobs}
@@ -278,7 +321,7 @@ class _Batch:
                 self.live.pop(job.key, None)
                 continue
             try:
-                check_original(item, job, self.sizes.get(job.media_key or ""))
+                check_original(item, job, self.sizes.get(job.media_key or ""), self.probe)
             except ReplaceError as exc:
                 self.fail(job, str(exc))
                 continue
@@ -380,6 +423,7 @@ def replace_batch(
     progress: Callable[[str], None] = lambda message: None,
     sizes: dict[str, set[int]] | None = None,
     watch: SessionWatch | None = None,
+    probe: Callable[[Path], dict] | None = None,
 ) -> dict[str, Outcome]:
     """Replace a batch of jobs; return each job's outcome, keyed by `UploadRecord.key`.
 
@@ -388,7 +432,7 @@ def replace_batch(
     fake in tests. A failure is recorded against its own job and never stops the rest.
     """
 
-    batch = _Batch(library, jobs, settings, progress, sizes, watch)
+    batch = _Batch(library, jobs, settings, progress, sizes, watch, probe)
     live, fail = batch.live, batch.fail
 
     # 3-4: the originals.
@@ -491,6 +535,7 @@ def remove_extra_copies(
     progress: Callable[[str], None] = lambda message: None,
     sizes: dict[str, set[int]] | None = None,
     watch: SessionWatch | None = None,
+    probe: Callable[[Path], dict] | None = None,
 ) -> dict[str, Outcome]:
     """Trash the replacements whose originals are refused; return each job's outcome.
 
@@ -505,7 +550,7 @@ def remove_extra_copies(
     "kept" (the original is not refused), "failed".
     """
 
-    batch = _Batch(library, jobs, settings, progress, sizes, watch)
+    batch = _Batch(library, jobs, settings, progress, sizes, watch, probe)
     batch.read_originals()
     # An original that is gone has no copy to remove: its replacement is the
     # only one left. Judged the same way as when replacing, so this path stops
